@@ -1,0 +1,26 @@
+Source: cc-sessions
+Section: utils
+Priority: optional
+Maintainer: Aljaz Gracnar <aljaz.gracnar@a-soft.si>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: cc-sessions
+Architecture: all
+Depends: ${misc:Depends},
+         python3 (>= 3.10),
+         python3-gi,
+         gir1.2-gtk-4.0,
+         gir1.2-vte-3.91,
+         gir1.2-webkit-6.0
+Description: Terminal with a live Claude Code session list
+ A GTK4 terminal that shows every running Claude Code session in a sidebar,
+ with the status each one reports: waiting on you, busy, running a shell
+ command, or idle. The distinction matters -- a tab title can only say
+ "working" or "not working", while "waiting" means it is blocked on you.
+ .
+ The terminal inherits your GNOME Terminal profile verbatim, so colours, font
+ and scrollback match the terminal you already use. Sessions that were open
+ when the app last stopped are offered back, and Claude conversations resume
+ where they left off.

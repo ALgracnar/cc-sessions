@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Sessions
+GenericName=Terminal
+Comment=Terminal with a live Claude Code session list
+Exec=@BINDIR@/cc-sessions
+Icon=cc-sessions
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;claude;sessions;
+StartupNotify=true
+StartupWMClass=eu.nevron.ccsessions
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=@BINDIR@/cc-sessions

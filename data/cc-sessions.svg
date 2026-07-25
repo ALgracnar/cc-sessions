@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- cc-sessions: a session list beside a terminal prompt.
+       Colours are the app's own status vocabulary: waiting / busy / idle. -->
+  <rect x="2" y="6" width="60" height="52" rx="8" fill="#2B2B2B"/>
+  <rect x="2.75" y="6.75" width="58.5" height="50.5" rx="7.25" fill="none"
+        stroke="#5E5C64" stroke-width="1.5"/>
+
+  <!-- sidebar panel -->
+  <path d="M2 14 a8 8 0 0 1 8-8 h14 v52 h-14 a8 8 0 0 1 -8-8 z" fill="#31333A"/>
+
+  <!-- three session rows, each with its status dot -->
+  <circle cx="10" cy="19" r="2.6" fill="#E9AD0C"/>
+  <rect x="15" y="17.6" width="7" height="2.8" rx="1.4" fill="#A9B7C6" opacity="0.75"/>
+
+  <circle cx="10" cy="32" r="2.6" fill="#2A7BDE"/>
+  <rect x="15" y="30.6" width="7" height="2.8" rx="1.4" fill="#A9B7C6" opacity="0.75"/>
+
+  <circle cx="10" cy="45" r="2.6" fill="#33DA7A"/>
+  <rect x="15" y="43.6" width="7" height="2.8" rx="1.4" fill="#A9B7C6" opacity="0.75"/>
+
+  <!-- terminal prompt -->
+  <path d="M32 26 l7 6 -7 6" fill="none" stroke="#A9B7C6" stroke-width="4"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="43" y="36" width="12" height="3.5" rx="1.75" fill="#A9B7C6"/>
+</svg>
