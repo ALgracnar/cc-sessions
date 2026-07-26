@@ -28,7 +28,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
 
-from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 import roster
 import state
@@ -80,6 +80,19 @@ def short_path(path):
     if len(parts) > 3:
         return os.sep.join(["…"] + parts[-2:])
     return path
+
+
+def item_key(kind, obj, owned=None):
+    """A stable id for a sidebar row, used by manual ordering.
+
+    Deliberately keyed on the Claude session id when there is one, so a row
+    keeps its place across resume: the dormant record and the live session it
+    becomes share an id, where our internal per-process key would not.
+    """
+    if kind == "record":
+        return obj.get("session_id") or ("name:" + (obj.get("name") or ""))
+    sess = owned if owned is not None else obj
+    return getattr(sess, "session_id", None) or ("local:" + sess.key)
 
 
 def load_css(provider, css):
@@ -264,6 +277,34 @@ class SettingsDialog(Gtk.Window):
 
         self.folder = FolderRow(self, app.default_folder())
         box.append(self.folder)
+
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        sort_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        sort_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        sort_text.set_hexpand(True)
+        sort_label = Gtk.Label(label="Rearrange the list automatically", xalign=0)
+        sort_text.append(sort_label)
+        sort_hint = Gtk.Label(xalign=0)
+        sort_hint.set_markup(
+            "<span alpha='55%'>On: sessions waiting on you move to the top by "
+            "themselves.  Off: the order stays put and you drag rows to "
+            "arrange them.</span>"
+        )
+        sort_hint.set_wrap(True)
+        sort_text.append(sort_hint)
+        sort_row.append(sort_text)
+
+        self.sort_switch = Gtk.Switch()
+        self.sort_switch.set_valign(Gtk.Align.CENTER)
+        self.sort_switch.set_active(app.auto_sort())
+        # Live, so the effect is visible while the dialog is still open.
+        self.sort_switch.connect(
+            "notify::active",
+            lambda sw, _p: app.set_auto_sort(sw.get_active()),
+        )
+        sort_row.append(self.sort_switch)
+        box.append(sort_row)
 
         box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
@@ -733,6 +774,64 @@ class SessionWindow(Gtk.ApplicationWindow):
         row.set_child(box)
         return row
 
+    # -- ordering ----------------------------------------------------------
+
+    def _auto_sorted(self, items):
+        """The original behaviour: the list rearranges itself as state changes.
+
+        Live sessions first with anything blocked on you at the top, then
+        dormant rows, then sessions still starting up.
+        """
+        group = {"entry": 0, "record": 1, "local": 2}
+        rank = {"blocked": 0, "finished": 1}
+
+        def key(item):
+            kind, obj, _owned = item
+            if kind == "entry":
+                return (0, rank.get(self.app.attention_kind(obj), 2),
+                        obj.rank, obj.name.lower())
+            name = (obj.get("name") if kind == "record" else obj.name) or ""
+            return (group[kind], 0, 0, name.lower())
+
+        return sorted(items, key=key)
+
+    def _manually_sorted(self, items):
+        """Static order you control by dragging; new rows land at the bottom.
+
+        Nothing here reacts to status changes -- that is the point. A row only
+        moves when you move it.
+        """
+        order = self.app.manual_order()
+        position = {k: i for i, k in enumerate(order)}
+        # Unknown rows keep the auto order among themselves and go last, so a
+        # newly started session appears predictably at the bottom.
+        fallback = {item_key(*i): n for n, i in enumerate(self._auto_sorted(items))}
+        return sorted(
+            items,
+            key=lambda i: (position.get(item_key(*i), len(order) + fallback[item_key(*i)]),),
+        )
+
+    def _attach_reorder(self, row):
+        """Make a row draggable onto its siblings (manual mode only)."""
+        source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        source.connect(
+            "prepare",
+            lambda _s, _x, _y, key=row.item_key: Gdk.ContentProvider.new_for_value(key),
+        )
+        row.add_controller(source)
+
+        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+
+        def dropped(_t, value, _x, _y, key=row.item_key):
+            if not isinstance(value, str) or not value or value == key:
+                return False
+            self.app.move_in_order(value, key,
+                                   [r.item_key for r in self._rows])
+            return True
+
+        target.connect("drop", dropped)
+        row.add_controller(target)
+
     def refresh(self, entries=None):
         if entries is None:
             entries = roster.read()
@@ -747,13 +846,6 @@ class SessionWindow(Gtk.ApplicationWindow):
             if (lambda s: s is not None and self.owns(s))(self.app.session_for_entry(e))
         ]
 
-        # Blocked first, then finished-while-away, then Claude's own ordering.
-        order = {"blocked": 0, "finished": 1}
-        entries = sorted(
-            entries,
-            key=lambda e: (order.get(self.app.attention_kind(e), 2), e.rank, e.name.lower()),
-        )
-
         self._update_title()
 
         # Sessions we own that the roster does not describe: plain shell tabs
@@ -767,7 +859,19 @@ class SessionWindow(Gtk.ApplicationWindow):
             if self.owns(sess) and not any(sess.matches(e) for e in entries)
         ]
 
-        signature = (roster.signature(entries),
+        # One list, ordered once -- rather than three groups each with their
+        # own rules, which is what made the order hard to reason about.
+        items = [("entry", e, self.app.session_for_entry(e)) for e in entries]
+        items += [("record", r, None) for r in self.restorable]
+        items += [("local", s, s) for s in local_only]
+
+        if self.app.auto_sort():
+            items = self._auto_sorted(items)
+        else:
+            items = self._manually_sorted(items)
+
+        signature = (tuple(item_key(k, o, w) for k, o, w in items),
+                     roster.signature(entries),
                      tuple(self.app.attention_kind(e) for e in entries),
                      tuple((s.key, s.mode, s.pid is None, s.exited, s.current_cwd())
                            for s in local_only),
@@ -787,24 +891,20 @@ class SessionWindow(Gtk.ApplicationWindow):
             self.listbox.remove(row)
         self._rows = []
 
-        for entry in entries:
-            owned = self.app.session_for_entry(entry)
-            row = self._make_row(entry, owned, self.app.attention_kind(entry))
+        manual = not self.app.auto_sort()
+        for kind, obj, owned in items:
+            if kind == "entry":
+                row = self._make_row(obj, owned, self.app.attention_kind(obj))
+            elif kind == "record":
+                row = self._make_restore_row(obj)
+            else:
+                row = self._make_local_row(obj)
+            row.item_key = item_key(kind, obj, owned)
+            if manual:
+                self._attach_reorder(row)
             self.listbox.append(row)
             self._rows.append(row)
             if owned is not None and owned.terminal is selected:
-                self.listbox.select_row(row)
-
-        for record in self.restorable:
-            row = self._make_restore_row(record)
-            self.listbox.append(row)
-            self._rows.append(row)
-
-        for sess in local_only:
-            row = self._make_local_row(sess)
-            self.listbox.append(row)
-            self._rows.append(row)
-            if sess.terminal is selected:
                 self.listbox.select_row(row)
 
     # -- actions -----------------------------------------------------------
@@ -1011,6 +1111,42 @@ class CCSessions(Gtk.Application):
     def set_claude_args(self, args):
         self.config["claude_args"] = args or ""
         save_config(self.config)
+
+    # -- list ordering -----------------------------------------------------
+
+    def auto_sort(self):
+        """True (default) keeps the original self-rearranging list."""
+        return bool(self.config.get("auto_sort", True))
+
+    def set_auto_sort(self, enabled):
+        self.config["auto_sort"] = bool(enabled)
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
+    def manual_order(self):
+        order = self.config.get("manual_order")
+        return list(order) if isinstance(order, list) else []
+
+    def move_in_order(self, src_key, dst_key, seed_keys=()):
+        """Put src_key where dst_key is, and remember it."""
+        order = self.manual_order()
+        # Rows that have never been dragged are not in the stored order yet;
+        # seed them from what is currently on screen so the first drag has
+        # something coherent to rearrange.
+        for key in seed_keys:
+            if key not in order:
+                order.append(key)
+        if src_key not in order or dst_key not in order:
+            return
+        order.remove(src_key)
+        order.insert(order.index(dst_key), src_key)
+        self.config["manual_order"] = order
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
 
     # -- zoom --------------------------------------------------------------
 

@@ -33,6 +33,9 @@ Nothing surfaces it. This does.
   `claude -r <id>`. Written continuously, so it survives a crash rather than
   depending on clean shutdown.
 - **Multiple windows**, each owning its own sessions, sharing one recovery pool.
+- **Two list orders**: automatic (waiting sessions rise to the top by
+  themselves) or static, where you drag rows into the order you want and
+  nothing moves on its own.
 
 ## Install
 
@@ -83,6 +86,8 @@ Stored in `~/.config/cc-sessions/config.json`:
 | `default_folder` | where the toolbar buttons start sessions |
 | `claude_command` | binary to run (default `claude`); a path with `/` is used verbatim |
 | `claude_args` | flags added to every session, e.g. `--dangerously-skip-permissions` |
+| `auto_sort` | `true` (default) rearranges the list as state changes; `false` keeps it static and drag-orderable |
+| `manual_order` | the order you dragged rows into, used when `auto_sort` is off |
 | `terminal_zoom` | terminal text scale |
 | `sidebar_zoom` | session list text scale |
 
