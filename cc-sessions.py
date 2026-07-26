@@ -550,17 +550,13 @@ class SessionWindow(Gtk.ApplicationWindow):
             name.add_css_class("ccs-external")
         top.append(name)
 
-        age = Gtk.Label(label=entry.describe_age(), xalign=1)
-        age.add_css_class("ccs-age")
-        top.append(age)
-        row.age_label = age
-
-        # Only sessions we own can be closed -- we have no handle on anything
-        # started outside the app.
-        if owned is not None:
-            top.append(self._close_button(owned))
-
         box.append(top)
+
+        # The age and the close button sit on the status line, not the name
+        # line: the status is short ("idle", "busy"), the name is the long
+        # thing, so this is where the free space actually is. On the top line
+        # they ellipsized the name to make room for themselves.
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         # Say the one thing that matters, without the internal status name
         # alongside it. `waitingFor` is already readable on its own ("input
@@ -572,10 +568,23 @@ class SessionWindow(Gtk.ApplicationWindow):
         else:
             detail = entry.status_label
         sub = Gtk.Label(label=detail, xalign=0)
+        sub.set_hexpand(True)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
         sub.add_css_class("ccs-sub-%s" % colour)
-        box.append(sub)
+        line.append(sub)
+
+        age = Gtk.Label(label=entry.describe_age(), xalign=1)
+        age.add_css_class("ccs-age")
+        line.append(age)
+        row.age_label = age
+
+        # Only sessions we own can be closed -- we have no handle on anything
+        # started outside the app.
+        if owned is not None:
+            line.append(self._close_button(owned))
+
+        box.append(line)
 
         # The roster records where Claude started; /proc knows where it is.
         where = owned.current_cwd() if owned is not None else entry.cwd
@@ -692,14 +701,9 @@ class SessionWindow(Gtk.ApplicationWindow):
         name.add_css_class("ccs-name")
         name.add_css_class("ccs-external")   # dimmed
         top.append(name)
-
-        dismiss = Gtk.Button(label="×")
-        dismiss.add_css_class("ccs-close")
-        dismiss.set_valign(Gtk.Align.CENTER)
-        dismiss.set_tooltip_text("Forget this session")
-        dismiss.connect("clicked", lambda *_: self.dismiss_restorable(record))
-        top.append(dismiss)
         box.append(top)
+
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         # Type first: the sidebar truncates, so "terminal"/"session" must
         # survive being cut off. "from last session" did not distinguish them.
@@ -714,10 +718,19 @@ class SessionWindow(Gtk.ApplicationWindow):
             "Terminal from last run" if is_shell else "Claude session from last run",
             record.get("cwd", "")))
         sub = Gtk.Label(label=detail, xalign=0)
+        sub.set_hexpand(True)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
         sub.add_css_class("ccs-sub-dim")
-        box.append(sub)
+        line.append(sub)
+
+        dismiss = Gtk.Button(label="×")
+        dismiss.add_css_class("ccs-close")
+        dismiss.set_valign(Gtk.Align.CENTER)
+        dismiss.set_tooltip_text("Forget this session")
+        dismiss.connect("clicked", lambda *_: self.dismiss_restorable(record))
+        line.append(dismiss)
+        box.append(line)
 
         path = Gtk.Label(label=short_path(record.get("cwd", "")), xalign=0)
         path.set_ellipsize(3)
@@ -769,8 +782,9 @@ class SessionWindow(Gtk.ApplicationWindow):
         name.set_ellipsize(3)
         name.add_css_class("ccs-name")
         top.append(name)
-        top.append(self._close_button(sess))
         box.append(top)
+
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         if sess.exited:
             detail = "ended"
@@ -779,10 +793,14 @@ class SessionWindow(Gtk.ApplicationWindow):
         else:
             detail = "starting…"
         sub = Gtk.Label(label=detail, xalign=0)
+        sub.set_hexpand(True)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
         sub.add_css_class("ccs-sub-%s" % colour)
-        box.append(sub)
+        line.append(sub)
+
+        line.append(self._close_button(sess))
+        box.append(line)
 
         path = Gtk.Label(label=short_path(sess.current_cwd()), xalign=0)
         path.set_ellipsize(3)
@@ -862,8 +880,8 @@ class SessionWindow(Gtk.ApplicationWindow):
         """
         box = row.get_child()
         top = box.get_first_child() if box is not None else None
-        status = top.get_next_sibling() if top is not None else None
-        if status is not None:
+        line = top.get_next_sibling() if top is not None else None
+        if line is not None:
             grip = Gtk.Label(label="⠿")
             grip.add_css_class("ccs-grip")
             grip.set_tooltip_text("Drag to reorder")
@@ -875,14 +893,9 @@ class SessionWindow(Gtk.ApplicationWindow):
             )
             grip.add_controller(source)
 
-            # The status line is a plain label, so wrap it to seat the grip in
-            # front of it, then put the pair back where the label was.
-            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            box.remove(status)
-            status.set_hexpand(True)
-            line.append(grip)
-            line.append(status)
-            box.insert_child_after(line, top)
+            # The status line is already a box (status … age ×), so the grip
+            # just takes the front seat.
+            line.prepend(grip)
 
         # Drops are still accepted anywhere on the row -- only the *start* of a
         # drag needs to be deliberate.
