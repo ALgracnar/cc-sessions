@@ -389,6 +389,17 @@ class SettingsDialog(Gtk.Window):
         args_hint.set_wrap(True)
         box.append(args_hint)
 
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        side_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        side_label = Gtk.Label(label="Session list side", xalign=0)
+        side_label.set_hexpand(True)
+        side_row.append(side_label)
+        self.side_dropdown = Gtk.DropDown.new_from_strings(["Left", "Right"])
+        self.side_dropdown.set_selected(1 if app.sidebar_side() == "right" else 0)
+        side_row.append(self.side_dropdown)
+        box.append(side_row)
+
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         cancel = Gtk.Button(label="Cancel")
@@ -410,6 +421,9 @@ class SettingsDialog(Gtk.Window):
         self.app.set_claude_args(self.args_entry.get_text().strip())
         self.app.set_terminal_zoom(self.term_spin.get_value() / 100.0)
         self.app.set_sidebar_zoom(self.side_spin.get_value() / 100.0)
+        self.app.set_sidebar_side(
+            "right" if self.side_dropdown.get_selected() == 1 else "left"
+        )
         self._saved = True
         self.close()
 
@@ -439,18 +453,50 @@ class SessionWindow(Gtk.ApplicationWindow):
         self.outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.paned.set_position(250)
         self.paned.set_vexpand(True)
-        self.paned.set_start_child(self._build_sidebar())
-        self.paned.set_end_child(self._build_terminal_area())
-        self.paned.set_resize_start_child(False)
-        self.paned.set_shrink_start_child(False)
+        self.sidebar_box = self._build_sidebar()
+        self._build_terminal_area()      # creates self.stack
+        self.seat_panes(self.app.sidebar_side())
 
         self.outer.append(self.paned)
         self.set_child(self.outer)
         self.add_css_class("ccs-window")
 
         self.refresh()
+
+    def seat_panes(self, side):
+        """Seat the session list on the chosen side of the divider.
+
+        Safe to call on a live window: both children are held by Python refs
+        and stay inside the same window, so reparenting them across the paned
+        does not tear down the terminals.
+        """
+        on_right = side == "right"
+        self.paned.set_start_child(None)
+        self.paned.set_end_child(None)
+        if on_right:
+            self.paned.set_start_child(self.stack)
+            self.paned.set_end_child(self.sidebar_box)
+        else:
+            self.paned.set_start_child(self.sidebar_box)
+            self.paned.set_end_child(self.stack)
+        # Window growth goes to the terminal; the list keeps its width.
+        self.paned.set_resize_start_child(on_right)
+        self.paned.set_shrink_start_child(on_right)
+        self.paned.set_resize_end_child(not on_right)
+        self.paned.set_shrink_end_child(not on_right)
+        # 4px gap so terminal text does not sit flush against the divider --
+        # on whichever side the divider now is.
+        self.stack.set_margin_start(0 if on_right else 4)
+        self.stack.set_margin_end(4 if on_right else 0)
+        # Paned position is measured from the LEFT edge, so a right-hand list
+        # sits at (width - list width). Before the window is realized the
+        # allocated width is 0; fall back to the default size.
+        if on_right:
+            width = self.get_width() or self.get_default_size()[0]
+            self.paned.set_position(max(200, width - 250))
+        else:
+            self.paned.set_position(250)
 
     # -- construction ------------------------------------------------------
 
@@ -502,8 +548,8 @@ class SessionWindow(Gtk.ApplicationWindow):
         self.stack = Gtk.Stack()
         self.stack.set_hexpand(True)
         self.stack.set_vexpand(True)
-        # 4px gap so terminal text does not sit flush against the divider.
-        self.stack.set_margin_start(4)
+        # The divider-side breathing gap is set by seat_panes(), which knows
+        # which side the divider is on.
 
         self.placeholder = Gtk.Label()
         self.placeholder.set_markup(
@@ -1209,6 +1255,17 @@ class CCSessions(Gtk.Application):
         self.config["claude_args"] = args or ""
         save_config(self.config)
 
+    def sidebar_side(self):
+        """Which side of the window the session list sits on."""
+        return "right" if self.config.get("sidebar_side") == "right" else "left"
+
+    def set_sidebar_side(self, side):
+        self.config["sidebar_side"] = "right" if side == "right" else "left"
+        save_config(self.config)
+        self._apply_css()      # the divider border + padding swap edges
+        for window in self.session_windows():
+            window.seat_panes(self.sidebar_side())
+
     # -- list ordering -----------------------------------------------------
 
     def auto_sort(self):
@@ -1504,8 +1561,8 @@ class CCSessions(Gtk.Application):
             """
             .ccs-window, .ccs-sidebar {{ background: {bg}; }}
             /* 4px breathing room so rows and the close button do not sit
-               flush against the divider line. */
-            .ccs-sidebar {{ border-right: 1px solid {line}; padding-right: 4px; }}
+               flush against the divider line -- whichever side that is. */
+            .ccs-sidebar {{ {divider_edge}: 1px solid {line}; {divider_pad}: 4px; }}
             .ccs-header {{
                 color: {dim}; font-family: {font}; font-size: {s_header};
                 letter-spacing: 0.09em; padding: 0 0 0 12px;
@@ -1553,6 +1610,10 @@ class CCSessions(Gtk.Application):
                 font=theme.font_family_css,
                 s_header=rem(0.75), s_dot=rem(0.62),
                 s_name=rem(0.92), s_meta=rem(0.78),
+                divider_edge=("border-left" if self.sidebar_side() == "right"
+                              else "border-right"),
+                divider_pad=("padding-left" if self.sidebar_side() == "right"
+                             else "padding-right"),
             )
         ]
         for name in COLOUR_NAMES:
