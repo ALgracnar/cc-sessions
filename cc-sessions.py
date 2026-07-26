@@ -37,16 +37,29 @@ from theme import TerminalTheme
 
 APP_ID = "eu.nevron.ccsessions"
 
-# Which palette slot represents each status. Using the user's own ANSI colours
-# means the sidebar is in the same visual language as everything in the
-# terminal below it.
-STATUS_PALETTE = {
-    "waiting": 11,  # bright yellow — wants you
-    "busy": 12,     # bright blue   — working
-    "shell": 14,    # bright cyan   — running a command
-    "idle": 10,     # bright green  — done, nothing pending
+# Colours by meaning, not by palette index. Mostly the user's own ANSI colours
+# so the sidebar speaks the same visual language as the terminal below it --
+# except "waiting", which needs to be unmistakable next to "finished". The ANSI
+# set has no orange, so that one is a literal: Darcula's own orange, which sits
+# correctly in this theme.
+WAITING_ORANGE = "#CC7832"
+
+PALETTE_SLOT = {
+    "busy": 12,      # bright blue   — working
+    "shell": 14,     # bright cyan   — running a command
+    "idle": 10,      # bright green  — done, nothing pending
+    "finished": 11,  # bright yellow — finished while you were away
+    "dim": 8,        # bright black  — dormant / unknown
 }
-DIM_SLOT = 8        # bright black — dead/unknown
+LITERAL_COLOUR = {"waiting": WAITING_ORANGE}
+COLOUR_NAMES = list(PALETTE_SLOT) + list(LITERAL_COLOUR)
+LIVE_STATUSES = ("waiting", "busy", "shell", "idle")
+
+
+def colour_for(theme, name):
+    if name in LITERAL_COLOUR:
+        return LITERAL_COLOUR[name]
+    return theme.palette_css(PALETTE_SLOT.get(name, PALETTE_SLOT["dim"]))
 
 
 CONFIG_DIR = os.path.expanduser("~/.config/cc-sessions")
@@ -515,13 +528,15 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         # Only a genuinely blocked session gets the loud treatment. A session
         # that merely finished a turn is marked, not shouted about.
-        slot = STATUS_PALETTE.get(entry.status, DIM_SLOT)
+        colour = entry.status if entry.status in LIVE_STATUSES else "dim"
         if attention == "blocked":
-            slot = STATUS_PALETTE["waiting"]
+            colour = "waiting"      # orange: blocked on you
+        elif attention == "finished":
+            colour = "finished"     # yellow: done, but you were not looking
 
         dot = Gtk.Label(label="●" if attention else "■")
         dot.add_css_class("ccs-dot")
-        dot.add_css_class("ccs-dot-%d" % slot)
+        dot.add_css_class("ccs-dot-%s" % colour)
         top.append(dot)
 
         name = Gtk.Label(label=entry.name, xalign=0)
@@ -545,17 +560,19 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         box.append(top)
 
-        detail = entry.status_label
-        if entry.waiting_for:
-            detail = "%s: %s" % (entry.status_label, entry.waiting_for)
-        if attention == "blocked":
-            detail = "waiting on you  ·  %s" % detail
+        # Say the one thing that matters, without the internal status name
+        # alongside it. `waitingFor` is already readable on its own ("input
+        # needed", "dialog open", "sandbox request").
+        if entry.status == "waiting" or attention == "blocked":
+            detail = entry.waiting_for or "input needed"
         elif attention == "finished":
-            detail = "finished while you were away  ·  %s" % detail
+            detail = "finished"
+        else:
+            detail = entry.status_label
         sub = Gtk.Label(label=detail, xalign=0)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
-        sub.add_css_class("ccs-sub-%d" % slot)
+        sub.add_css_class("ccs-sub-%s" % colour)
         box.append(sub)
 
         # The roster records where Claude started; /proc knows where it is.
@@ -569,19 +586,18 @@ class SessionWindow(Gtk.ApplicationWindow):
         return row
 
     def _update_title(self):
-        """Title names the session you are looking at, not just the app."""
+        """Just the session you are looking at -- nothing appended.
+
+        The blocked count used to be tacked on here, but the sidebar already
+        shows that in orange and the title is the one place a plain name is
+        useful.
+        """
         current = self.stack.get_visible_child()
-        name = None
         for sess in self.app.sessions:
             if sess.terminal is current:
-                name = sess.name
-                break
-
-        blocked = self.app.blocked_count()
-        parts = [name or "Claude sessions"]
-        if blocked:
-            parts.append("%d waiting on you" % blocked)
-        self.set_title("  ·  ".join(parts))
+                self.set_title(sess.name)
+                return
+        self.set_title("Claude sessions")
 
     def _close_button(self, sess):
         button = Gtk.Button(label="×")
@@ -665,7 +681,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         # Always dim: colour means LIVE. A dormant row wearing the shell
         # colour read as an active tab, which is exactly the wrong signal.
         # The word "terminal" on the line below carries the distinction.
-        dot.add_css_class("ccs-dot-%d" % DIM_SLOT)
+        dot.add_css_class("ccs-dot-dim")
         top.append(dot)
 
         name = Gtk.Label(label=record.get("name") or "(unnamed)", xalign=0)
@@ -698,7 +714,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         sub = Gtk.Label(label=detail, xalign=0)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
-        sub.add_css_class("ccs-sub-%d" % DIM_SLOT)
+        sub.add_css_class("ccs-sub-dim")
         box.append(sub)
 
         path = Gtk.Label(label=short_path(record.get("cwd", "")), xalign=0)
@@ -740,10 +756,10 @@ class SessionWindow(Gtk.ApplicationWindow):
         box.add_css_class("ccs-row")
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        slot = STATUS_PALETTE["shell"] if sess.mode == "shell" else DIM_SLOT
+        colour = "shell" if sess.mode == "shell" else "dim"
         dot = Gtk.Label(label="■")
         dot.add_css_class("ccs-dot")
-        dot.add_css_class("ccs-dot-%d" % slot)
+        dot.add_css_class("ccs-dot-%s" % colour)
         top.append(dot)
 
         name = Gtk.Label(label=sess.name, xalign=0)
@@ -763,7 +779,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         sub = Gtk.Label(label=detail, xalign=0)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
-        sub.add_css_class("ccs-sub-%d" % slot)
+        sub.add_css_class("ccs-sub-%s" % colour)
         box.append(sub)
 
         path = Gtk.Label(label=short_path(sess.current_cwd()), xalign=0)
@@ -1414,19 +1430,19 @@ class CCSessions(Gtk.Application):
             """.format(
                 bg=theme.bg_css,
                 fg=theme.fg_css,
-                dim=theme.palette_css(DIM_SLOT),
-                line=theme.palette_css(DIM_SLOT),
-                sel=theme.palette_css(STATUS_PALETTE["busy"]),
-                attn=theme.palette_css(STATUS_PALETTE["waiting"]),
+                dim=colour_for(theme, "dim"),
+                line=colour_for(theme, "dim"),
+                sel=colour_for(theme, "busy"),
+                attn=colour_for(theme, "waiting"),
                 font=theme.font_family_css,
                 s_header=rem(0.75), s_dot=rem(0.62),
                 s_name=rem(0.92), s_meta=rem(0.78),
             )
         ]
-        for slot in set(list(STATUS_PALETTE.values()) + [DIM_SLOT]):
-            colour = theme.palette_css(slot)
-            parts.append(".ccs-dot-%d { color: %s; }" % (slot, colour))
-            parts.append(".ccs-sub-%d { color: %s; }" % (slot, colour))
+        for name in COLOUR_NAMES:
+            value = colour_for(theme, name)
+            parts.append(".ccs-dot-%s { color: %s; }" % (name, value))
+            parts.append(".ccs-sub-%s { color: %s; }" % (name, value))
 
         # Reuse one provider and just reload its content. Adding a new provider
         # on every zoom step would stack them on the display forever.
