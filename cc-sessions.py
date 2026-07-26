@@ -1093,6 +1093,29 @@ class SessionWindow(Gtk.ApplicationWindow):
         self._last_signature = None
         self.refresh()
 
+    def cycle_session(self, step):
+        """Ctrl+Down / Ctrl+Up: step through the list in its visible order.
+
+        Only rows with a live terminal of ours take part. Dormant rows are
+        skipped deliberately -- landing on one would silently RESUME it -- and
+        external rows have no terminal here to show.
+        """
+        rows = [r for r in self._rows if getattr(r, "session", None) is not None]
+        if not rows:
+            return
+        current = self.stack.get_visible_child()
+        index = next(
+            (i for i, r in enumerate(rows) if r.session.terminal is current), None
+        )
+        if index is None:
+            # Nothing of ours on screen yet: Down enters at the top of the
+            # list, Up at the bottom.
+            index = 0 if step > 0 else len(rows) - 1
+        else:
+            index = (index + step) % len(rows)
+        self.listbox.select_row(rows[index])
+        self.show_session(rows[index].session)
+
     def show_session(self, sess):
         """Display a session here, taking it from another window if needed.
 
@@ -1150,6 +1173,8 @@ class CCSessions(Gtk.Application):
             # embedding app. Without them Ctrl+Shift+C/V silently did nothing.
             ("copy", lambda *_: self.copy_selection(), ["<Control><Shift>c"]),
             ("paste", lambda *_: self.paste_clipboard(), ["<Control><Shift>v"]),
+            ("next-session", lambda *_: self.cycle_session(1), ["<Control>Down"]),
+            ("prev-session", lambda *_: self.cycle_session(-1), ["<Control>Up"]),
             ("zoom-in", lambda *_: self.adjust_zoom(0.1),
              ["<Control>plus", "<Control>equal", "<Control>KP_Add"]),
             ("zoom-out", lambda *_: self.adjust_zoom(-0.1),
@@ -1513,6 +1538,11 @@ class CCSessions(Gtk.Application):
             if sess.terminal is current:
                 self.close_session(sess)
                 return
+
+    def cycle_session(self, step):
+        window = self.get_active_window()
+        if isinstance(window, SessionWindow):
+            window.cycle_session(step)
 
     def current_terminal(self):
         """The terminal on screen in the focused window, if any."""
