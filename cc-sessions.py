@@ -850,17 +850,27 @@ class SessionWindow(Gtk.ApplicationWindow):
         """
         box = row.get_child()
         top = box.get_first_child() if box is not None else None
-        if top is not None:
+        status = top.get_next_sibling() if top is not None else None
+        if status is not None:
             grip = Gtk.Label(label="⠿")
             grip.add_css_class("ccs-grip")
             grip.set_tooltip_text("Drag to reorder")
+            grip.set_valign(Gtk.Align.CENTER)
             source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
             source.connect(
                 "prepare",
                 lambda _s, _x, _y, key=row.item_key: Gdk.ContentProvider.new_for_value(key),
             )
             grip.add_controller(source)
-            top.prepend(grip)
+
+            # The status line is a plain label, so wrap it to seat the grip in
+            # front of it, then put the pair back where the label was.
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            box.remove(status)
+            status.set_hexpand(True)
+            line.append(grip)
+            line.append(status)
+            box.insert_child_after(line, top)
 
         # Drops are still accepted anywhere on the row -- only the *start* of a
         # drag needs to be deliberate.
@@ -1498,8 +1508,8 @@ class CCSessions(Gtk.Application):
                 color: {dim}; font-family: {font}; font-size: {s_meta};
             }}
             .ccs-grip {{
-                color: {dim}; font-family: {font}; font-size: {s_meta};
-                opacity: 0.55; padding-right: 2px;
+                color: {dim}; font-family: {font}; font-size: {s_name};
+                opacity: 0.5; padding: 0 2px;
             }}
             .ccs-grip:hover {{ opacity: 1; }}
             .ccs-close {{
