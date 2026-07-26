@@ -28,7 +28,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
 
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Vte
 
 import roster
 import state
@@ -1146,6 +1146,10 @@ class CCSessions(Gtk.Application):
             ("new-window", lambda *_: self.new_window(), ["<Control><Shift>n"]),
             ("new-session", lambda *_: self._new_session_here(), ["<Control><Shift>t"]),
             ("close-session", lambda *_: self.close_current(), ["<Control><Shift>w"]),
+            # VTE ships with NO copy/paste bindings -- these belong to the
+            # embedding app. Without them Ctrl+Shift+C/V silently did nothing.
+            ("copy", lambda *_: self.copy_selection(), ["<Control><Shift>c"]),
+            ("paste", lambda *_: self.paste_clipboard(), ["<Control><Shift>v"]),
             ("zoom-in", lambda *_: self.adjust_zoom(0.1),
              ["<Control>plus", "<Control>equal", "<Control>KP_Add"]),
             ("zoom-out", lambda *_: self.adjust_zoom(-0.1),
@@ -1509,6 +1513,29 @@ class CCSessions(Gtk.Application):
             if sess.terminal is current:
                 self.close_session(sess)
                 return
+
+    def current_terminal(self):
+        """The terminal on screen in the focused window, if any."""
+        window = self.get_active_window()
+        if not isinstance(window, SessionWindow):
+            return None
+        current = window.stack.get_visible_child()
+        for sess in self.sessions:
+            if sess.terminal is current:
+                return sess.terminal
+        return None
+
+    def copy_selection(self):
+        terminal = self.current_terminal()
+        if terminal is not None and terminal.get_has_selection():
+            # TEXT, not HTML: pasting into an editor should give the characters
+            # on screen, not markup dressed up with the terminal's colours.
+            terminal.copy_clipboard_format(Vte.Format.TEXT)
+
+    def paste_clipboard(self):
+        terminal = self.current_terminal()
+        if terminal is not None:
+            terminal.paste_clipboard()
 
     def clear_attention_for(self, sess):
         """Clear the flag the moment a session is opened, not a tick later."""
