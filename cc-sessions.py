@@ -839,14 +839,31 @@ class SessionWindow(Gtk.ApplicationWindow):
         return sorted(items, key=lambda i: position.get(item_key(*i), len(order)))
 
     def _attach_reorder(self, row):
-        """Make a row draggable onto its siblings (manual mode only)."""
-        source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
-        source.connect(
-            "prepare",
-            lambda _s, _x, _y, key=row.item_key: Gdk.ContentProvider.new_for_value(key),
-        )
-        row.add_controller(source)
+        """Make a row draggable onto its siblings (manual mode only).
 
+        The drag starts from an explicit grip, NOT from the row itself. A
+        GtkDragSource on the whole row is a gesture that claims the button
+        sequence, so the smallest movement while pressing began a drag and the
+        row never activated -- clicking a session simply did nothing. Giving
+        drag its own handle removes the conflict entirely, and makes it
+        discoverable rather than a hidden gesture.
+        """
+        box = row.get_child()
+        top = box.get_first_child() if box is not None else None
+        if top is not None:
+            grip = Gtk.Label(label="⠿")
+            grip.add_css_class("ccs-grip")
+            grip.set_tooltip_text("Drag to reorder")
+            source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+            source.connect(
+                "prepare",
+                lambda _s, _x, _y, key=row.item_key: Gdk.ContentProvider.new_for_value(key),
+            )
+            grip.add_controller(source)
+            top.prepend(grip)
+
+        # Drops are still accepted anywhere on the row -- only the *start* of a
+        # drag needs to be deliberate.
         target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
 
         def dropped(_t, value, _x, _y, key=row.item_key):
@@ -1480,6 +1497,11 @@ class CCSessions(Gtk.Application):
             .ccs-age, .ccs-path, .ccs-sub {{
                 color: {dim}; font-family: {font}; font-size: {s_meta};
             }}
+            .ccs-grip {{
+                color: {dim}; font-family: {font}; font-size: {s_meta};
+                opacity: 0.55; padding-right: 2px;
+            }}
+            .ccs-grip:hover {{ opacity: 1; }}
             .ccs-close {{
                 background: transparent; border: 0; box-shadow: none;
                 color: {dim}; font-family: {font}; padding: 0 4px;
