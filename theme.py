@@ -59,9 +59,34 @@ class TerminalTheme:
 
     # -- reading -----------------------------------------------------------
 
+    def _adopt_system_monospace(self):
+        """Upgrade the hardcoded fallback font to the desktop's monospace font.
+
+        Without gnome-terminal installed there is no profile to read, but the
+        desktop-wide monospace font is still the user's own choice -- generic
+        "Monospace" is not. The difference is visible: on a machine where the
+        generic alias resolved to DejaVu Sans Mono, that font's two-story 'i'
+        (serif flag + dot) reads as 'ï' at sidebar sizes, so "finished"
+        displayed as "fïnïshed".
+        """
+        if not _schema_exists(INTERFACE_SCHEMA):
+            return
+        try:
+            font_string = Gio.Settings.new(INTERFACE_SCHEMA).get_string(
+                "monospace-font-name"
+            )
+        except Exception:
+            return
+        if font_string:
+            self.font = Pango.FontDescription.from_string(font_string)
+            self.source = "system monospace"
+
     @classmethod
     def load(cls):
         theme = cls()
+        # Baseline first, so EVERY early return below (no gnome-terminal, no
+        # default profile, unreadable profile) still gets the user's font.
+        theme._adopt_system_monospace()
         if not _schema_exists(PROFILE_LIST_SCHEMA) or not _schema_exists(PROFILE_SCHEMA):
             return theme
 
