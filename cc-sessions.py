@@ -818,16 +818,25 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         Nothing here reacts to status changes -- that is the point. A row only
         moves when you move it.
+
+        Every row must be PINNED into the stored order the first time it is
+        seen, not merely fall back to the automatic order when absent. That was
+        the original bug: the stored order starts empty, so switching this mode
+        on appeared to do nothing at all -- the whole list kept auto-sorting
+        until you happened to drag something.
         """
         order = self.app.manual_order()
+        unseen = [
+            key for key in (item_key(*i) for i in self._auto_sorted(items))
+            if key not in order
+        ]
+        if unseen:
+            # Seed newcomers in automatic order, then leave them alone forever.
+            self.app.extend_order(unseen)
+            order = self.app.manual_order()
+
         position = {k: i for i, k in enumerate(order)}
-        # Unknown rows keep the auto order among themselves and go last, so a
-        # newly started session appears predictably at the bottom.
-        fallback = {item_key(*i): n for n, i in enumerate(self._auto_sorted(items))}
-        return sorted(
-            items,
-            key=lambda i: (position.get(item_key(*i), len(order) + fallback[item_key(*i)]),),
-        )
+        return sorted(items, key=lambda i: position.get(item_key(*i), len(order)))
 
     def _attach_reorder(self, row):
         """Make a row draggable onto its siblings (manual mode only)."""
@@ -1165,6 +1174,31 @@ class CCSessions(Gtk.Application):
         order = self.config.get("manual_order")
         return list(order) if isinstance(order, list) else []
 
+    def extend_order(self, keys):
+        """Pin newly seen rows at the bottom. Saves, but does NOT refresh.
+
+        Called from inside a refresh, so triggering another one here would
+        recurse.
+        """
+        order = self.manual_order()
+        order.extend(k for k in keys if k not in order)
+        self.config["manual_order"] = order
+        save_config(self.config)
+
+    def rename_order_key(self, old_key, new_key):
+        """Follow a row whose identity changed, keeping its position.
+
+        A session is 'local:session-3' until Claude registers it, then it
+        becomes its session id. Without this the row would look brand new a few
+        seconds after starting and jump to the bottom of a manual list.
+        """
+        order = self.manual_order()
+        if old_key not in order or new_key in order:
+            return
+        order[order.index(old_key)] = new_key
+        self.config["manual_order"] = order
+        save_config(self.config)
+
     def move_in_order(self, src_key, dst_key, seed_keys=()):
         """Put src_key where dst_key is, and remember it."""
         order = self.manual_order()
@@ -1382,6 +1416,10 @@ class CCSessions(Gtk.Application):
         for entry in entries:
             sess = self.session_for_entry(entry)
             if sess is not None:
+                if entry.session_id and not sess.session_id:
+                    # Its row identity is about to change; carry its manual
+                    # position across so it does not jump to the bottom.
+                    self.rename_order_key("local:" + sess.key, entry.session_id)
                 sess.session_id = entry.session_id
                 sess.last_status = entry.status
                 # Where Claude actually is, which may not be where this
