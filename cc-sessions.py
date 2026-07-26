@@ -37,21 +37,22 @@ from theme import TerminalTheme
 
 APP_ID = "eu.nevron.ccsessions"
 
-# Colours by meaning, not by palette index. Mostly the user's own ANSI colours
-# so the sidebar speaks the same visual language as the terminal below it --
-# except "waiting", which needs to be unmistakable next to "finished". The ANSI
-# set has no orange, so that one is a literal: Darcula's own orange, which sits
-# correctly in this theme.
-WAITING_ORANGE = "#CC7832"
+# Colours by meaning, not by palette index -- mostly the user's own ANSI
+# colours, so the sidebar speaks the same visual language as the terminal below
+# it.
+FINISHED_ORANGE = "#CC7832"
 
 PALETTE_SLOT = {
+    "waiting": 11,   # bright yellow — blocked on you; the loudest thing here
     "busy": 12,      # bright blue   — working
     "shell": 14,     # bright cyan   — running a command
     "idle": 10,      # bright green  — done, nothing pending
-    "finished": 11,  # bright yellow — finished while you were away
     "dim": 8,        # bright black  — dormant / unknown
 }
-LITERAL_COLOUR = {"waiting": WAITING_ORANGE}
+# Orange is a literal because the ANSI palette has none. It carries the quieter
+# of the two attention states -- finished while you were away -- leaving the
+# more insistent yellow for a session that is actually blocked.
+LITERAL_COLOUR = {"finished": FINISHED_ORANGE}
 COLOUR_NAMES = list(PALETTE_SLOT) + list(LITERAL_COLOUR)
 LIVE_STATUSES = ("waiting", "busy", "shell", "idle")
 
@@ -552,6 +553,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         age = Gtk.Label(label=entry.describe_age(), xalign=1)
         age.add_css_class("ccs-age")
         top.append(age)
+        row.age_label = age
 
         # Only sessions we own can be closed -- we have no handle on anything
         # started outside the app.
@@ -847,6 +849,24 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         target.connect("drop", dropped)
         row.add_controller(target)
+
+    def update_ages(self, entries):
+        """Retick the age labels without touching the rows themselves.
+
+        The list used to be rebuilt every second purely to advance these, which
+        swallowed clicks. Editing the label in place costs nothing and leaves
+        the widgets -- and any in-progress click or drag -- alone.
+        """
+        fresh = {}
+        for entry in entries:
+            sess = self.app.session_for_entry(entry)
+            if sess is not None:
+                fresh[item_key("entry", entry, sess)] = entry.describe_age()
+        for row in self._rows:
+            label = getattr(row, "age_label", None)
+            text = fresh.get(getattr(row, "item_key", None))
+            if label is not None and text is not None and label.get_label() != text:
+                label.set_label(text)
 
     def refresh(self, entries=None):
         if entries is None:
@@ -1378,6 +1398,7 @@ class CCSessions(Gtk.Application):
         for window in self.get_windows():
             if isinstance(window, SessionWindow):
                 window.refresh(entries)
+                window.update_ages(entries)
         return True
 
     # -- styling -----------------------------------------------------------

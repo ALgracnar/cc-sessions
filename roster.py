@@ -142,7 +142,11 @@ def signature(entries):
 
     Used to avoid rebuilding the sidebar on every tick when nothing moved.
     """
+    # Deliberately NOT including the age: it changes every second, which made
+    # the caller rebuild the whole sidebar once per second. Clicks landing near
+    # a rebuild were swallowed, because the row being clicked was destroyed
+    # mid-gesture. Ages are refreshed in place instead.
     return tuple(
-        (e.pid, e.name, e.status, e.waiting_for, int((e.status_age or 0) // 1))
+        (e.pid, e.name, e.status, e.waiting_for)
         for e in entries
     )
