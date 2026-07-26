@@ -800,7 +800,9 @@ class SessionWindow(Gtk.ApplicationWindow):
         Live sessions first with anything blocked on you at the top, then
         dormant rows, then sessions still starting up.
         """
-        group = {"entry": 0, "record": 1, "local": 2}
+        # Live rows above, dormant ones below. A session still starting up is
+        # live; a record you have not resumed is not.
+        group = {"entry": 0, "local": 1, "record": 2}
         rank = {"blocked": 0, "finished": 1}
 
         def key(item):
@@ -836,7 +838,17 @@ class SessionWindow(Gtk.ApplicationWindow):
             order = self.app.manual_order()
 
         position = {k: i for i, k in enumerate(order)}
-        return sorted(items, key=lambda i: position.get(item_key(*i), len(order)))
+
+        def sort_key(item):
+            # One exception to "nothing moves unless you move it": dormant rows
+            # always sit at the bottom. They are not part of the working set
+            # until resumed, so they should never come between live sessions --
+            # and a resumed one takes its manual place automatically, since the
+            # record and the session it becomes share an id.
+            return (1 if item[0] == "record" else 0,
+                    position.get(item_key(*item), len(order)))
+
+        return sorted(items, key=sort_key)
 
     def _attach_reorder(self, row):
         """Make a row draggable onto its siblings (manual mode only).
