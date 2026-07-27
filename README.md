@@ -32,6 +32,9 @@ Nothing surfaces it. This does.
   as greyed rows; clicking one resumes the actual conversation with
   `claude -r <id>`. Written continuously, so it survives a crash rather than
   depending on clean shutdown.
+- **Clickable links.** Explicit hyperlinks (OSC 8) open on a plain click;
+  a plain URL that was merely printed opens with Ctrl+click. Same split as
+  GNOME Terminal.
 - **Multiple windows**, each owning its own sessions, sharing one recovery pool.
 - **Two list orders**: automatic (waiting sessions rise to the top by
   themselves) or static, where you drag rows into the order you want and

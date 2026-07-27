@@ -3,6 +3,7 @@
 import os
 import shlex
 import subprocess
+import sys
 
 import gi
 
@@ -169,8 +170,15 @@ class TerminalSession:
         except Exception:
             self._url_tag = -1
 
-        click = Gtk.GestureClick(button=0)
-        click.connect("released", self._on_click)
+        # CAPTURE, not the default bubble phase: VTE handles mouse input itself
+        # (selection, and its own click behaviour) and claims the sequence, so a
+        # bubble-phase handler never ran -- links looked clickable and did
+        # nothing. Capturing lets us inspect the press first, and we claim the
+        # sequence ONLY when we are actually opening a link, so ordinary
+        # clicking and selecting are untouched.
+        click = Gtk.GestureClick(button=1)
+        click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        click.connect("pressed", self._on_click)
         self.terminal.add_controller(click)
 
     def link_at(self, x, y):
@@ -193,31 +201,41 @@ class TerminalSession:
         return match or None
 
     def _on_click(self, gesture, n_press, x, y):
-        state = gesture.get_current_event_state()
-        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        # Left button only. NOT middle: middle-click pastes the primary
-        # selection, and opening a browser as well would be a nasty surprise.
-        if gesture.get_current_button() != 1:
-            return
-        uri = self.link_at(x, y)
-        if not uri:
-            return
+        ctrl = bool(gesture.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK)
+
         explicit = False
         try:
             explicit = bool(self.terminal.check_hyperlink_at(x, y))
-        except Exception:
-            pass
+        except Exception as exc:
+            print("[cc-sessions] hyperlink check failed: %r" % exc, file=sys.stderr)
+
         # Ctrl+click for a plain URL; a bare click is enough for an explicit
         # OSC 8 hyperlink -- same as GNOME Terminal.
         if not (ctrl or explicit):
             return
+        uri = self.link_at(x, y)
+        if not uri:
+            return
+
+        # Ours now: stop VTE also starting a selection under the click.
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self.open_uri(uri)
+
+    @staticmethod
+    def open_uri(uri):
+        """Hand a URI to the desktop. Failures are reported, never swallowed."""
         try:
             Gtk.UriLauncher.new(uri=uri).launch(None, None, None, None)
-        except Exception:
-            try:
-                Gio.AppInfo.launch_default_for_uri(uri, None)
-            except Exception:
-                pass
+            return True
+        except Exception as exc:
+            print("[cc-sessions] UriLauncher failed for %s: %r" % (uri, exc),
+                  file=sys.stderr)
+        try:
+            return Gio.AppInfo.launch_default_for_uri(uri, None)
+        except Exception as exc:
+            print("[cc-sessions] launch_default_for_uri failed for %s: %r"
+                  % (uri, exc), file=sys.stderr)
+            return False
 
     # -- lifecycle ---------------------------------------------------------
 
