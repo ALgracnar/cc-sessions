@@ -43,11 +43,12 @@ APP_ID = "eu.nevron.ccsessions"
 FINISHED_ORANGE = "#CC7832"
 
 PALETTE_SLOT = {
-    "waiting": 11,   # bright yellow — blocked on you; the loudest thing here
-    "busy": 12,      # bright blue   — working
-    "shell": 14,     # bright cyan   — running a command
-    "idle": 10,      # bright green  — done, nothing pending
-    "dim": 8,        # bright black  — dormant / unknown
+    "waiting": 11,   # bright yellow  — blocked on you; the loudest thing here
+    "busy": 12,      # bright blue    — working
+    "shell": 14,     # bright cyan    — running a command
+    "idle": 10,      # bright green   — done, nothing pending
+    "done": 13,      # bright magenta — YOU marked it finished; ours, not Claude's
+    "dim": 8,        # bright black   — dormant / unknown
 }
 # Orange is a literal because the ANSI palette has none. It carries the quieter
 # of the two attention states -- finished while you were away -- leaving the
@@ -575,13 +576,20 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         # Only a genuinely blocked session gets the loud treatment. A session
         # that merely finished a turn is marked, not shouted about.
+        key = item_key("entry", entry, owned)
+        # Only an idle session can be marked done -- a busy or blocked one is
+        # plainly not finished, so offering the mark there would be nonsense.
+        done = entry.status == "idle" and self.app.is_done(key)
+
         colour = entry.status if entry.status in LIVE_STATUSES else "dim"
-        if attention == "blocked":
+        if done:
+            colour = "done"         # purple: you called it finished
+        elif attention == "blocked":
             colour = "waiting"      # orange: blocked on you
         elif attention == "finished":
             colour = "finished"     # yellow: done, but you were not looking
 
-        dot = Gtk.Label(label="●" if attention else "■")
+        dot = Gtk.Label(label="■" if done else ("●" if attention else "■"))
         dot.add_css_class("ccs-dot")
         dot.add_css_class("ccs-dot-%s" % colour)
         top.append(dot)
@@ -607,7 +615,9 @@ class SessionWindow(Gtk.ApplicationWindow):
         # Say the one thing that matters, without the internal status name
         # alongside it. `waitingFor` is already readable on its own ("input
         # needed", "dialog open", "sandbox request").
-        if entry.status == "waiting" or attention == "blocked":
+        if done:
+            detail = "idle  ·  done"
+        elif entry.status == "waiting" or attention == "blocked":
             detail = entry.waiting_for or "input needed"
         elif attention == "finished":
             detail = "finished"
@@ -619,6 +629,11 @@ class SessionWindow(Gtk.ApplicationWindow):
         sub.add_css_class("ccs-sub")
         sub.add_css_class("ccs-sub-%s" % colour)
         line.append(sub)
+
+        # The mark lives next to the status it qualifies, and only appears
+        # when Claude says idle -- it is an annotation on that state.
+        if owned is not None and entry.status == "idle":
+            line.append(self._done_button(key, done))
 
         age = Gtk.Label(label=entry.describe_age(), xalign=1)
         age.add_css_class("ccs-age")
@@ -655,6 +670,21 @@ class SessionWindow(Gtk.ApplicationWindow):
                 self.set_title(sess.name)
                 return
         self.set_title("Claude sessions")
+
+    def _done_button(self, key, done):
+        """Toggle YOUR 'done' mark on an idle session.
+
+        Separate from closing: a finished session often has to stay visible
+        until the work actually ships, so this settles it rather than ending it.
+        """
+        button = Gtk.Button(label="✓")
+        button.add_css_class("ccs-done-btn")
+        if done:
+            button.add_css_class("ccs-done-on")
+        button.set_valign(Gtk.Align.CENTER)
+        button.set_tooltip_text("Unmark as done" if done else "Mark as done")
+        button.connect("clicked", lambda *_: self.app.toggle_done(key))
+        return button
 
     def _close_button(self, sess):
         button = Gtk.Button(label="×")
@@ -1308,6 +1338,28 @@ class CCSessions(Gtk.Application):
             window._last_signature = None
             window.refresh()
 
+    # -- "done" marks ------------------------------------------------------
+
+    def done_keys(self):
+        """Sessions YOU marked finished. Ours entirely -- Claude knows nothing
+        of this: it reports `idle` either way. The point is to keep a finished
+        session in the list, visibly settled, until the work actually ships.
+        """
+        keys = self.config.get("done")
+        return set(keys) if isinstance(keys, list) else set()
+
+    def is_done(self, key):
+        return key in self.done_keys()
+
+    def toggle_done(self, key):
+        keys = self.done_keys()
+        keys.discard(key) if key in keys else keys.add(key)
+        self.config["done"] = sorted(keys)
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
     def manual_order(self):
         order = self.config.get("manual_order")
         return list(order) if isinstance(order, list) else []
@@ -1449,6 +1501,8 @@ class CCSessions(Gtk.Application):
         for entry in entries:
             key = self.entry_key(entry)
             live.add(key)
+            # A session you have marked done should not keep announcing that it
+            # finished -- you already know; that is why you marked it.
             watched = self.is_watched(entry)
             previous = self._prev_status.get(key)
 
@@ -1461,7 +1515,8 @@ class CCSessions(Gtk.Application):
                     # itself says so via waitingFor. Counts on first sighting
                     # and for external sessions too.
                     flag = "blocked" if not watched else None
-                elif entry.status == "idle" and previous in ("busy", "shell"):
+                elif (entry.status == "idle" and previous in ("busy", "shell")
+                      and not self.is_done(key)):
                     # It finished a turn while you were elsewhere. Worth
                     # knowing, but NOT the same as needing you: the last
                     # exchange may well have been "bye" / "ok bye". Claude
@@ -1651,6 +1706,13 @@ class CCSessions(Gtk.Application):
                 opacity: 0.5; padding: 0 2px;
             }}
             .ccs-grip:hover {{ opacity: 1; }}
+            .ccs-done-btn {{
+                background: transparent; border: 0; box-shadow: none;
+                color: {dim}; font-family: {font}; padding: 0 4px;
+                min-width: 0; min-height: 0; opacity: 0.45;
+            }}
+            .ccs-done-btn:hover {{ opacity: 1; background: transparent; }}
+            .ccs-done-on {{ color: {done}; opacity: 1; }}
             .ccs-close {{
                 background: transparent; border: 0; box-shadow: none;
                 color: {dim}; font-family: {font}; padding: 0 4px;
@@ -1664,6 +1726,7 @@ class CCSessions(Gtk.Application):
                 line=colour_for(theme, "dim"),
                 sel=colour_for(theme, "busy"),
                 attn=colour_for(theme, "waiting"),
+                done=colour_for(theme, "done"),
                 font=theme.font_family_css,
                 s_header=rem(0.75), s_dot=rem(0.62),
                 s_name=rem(0.92), s_meta=rem(0.78),

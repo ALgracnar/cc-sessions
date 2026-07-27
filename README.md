@@ -35,6 +35,10 @@ Nothing surfaces it. This does.
 - **Clickable links.** Explicit hyperlinks (OSC 8) open on a plain click;
   a plain URL that was merely printed opens with Ctrl+click. Same split as
   GNOME Terminal.
+- **Mark a session done.** When Claude reports `idle`, a ✓ appears next to
+  the status: click it and the row reads `idle · done` in purple, and stops
+  announcing that it finished. For work that is over but has to stay
+  visible until it ships. Click again to unmark.
 - **Multiple windows**, each owning its own sessions, sharing one recovery pool.
 - **Two list orders**: automatic (waiting sessions rise to the top by
   themselves) or static, where you drag rows into the order you want and
@@ -91,6 +95,7 @@ Stored in `~/.config/cc-sessions/config.json`:
 | `claude_args` | flags added to every session, e.g. `--dangerously-skip-permissions` |
 | `auto_sort` | `true` (default) rearranges the list as state changes; `false` keeps it static and drag-orderable |
 | `manual_order` | the order you dragged rows into, used when `auto_sort` is off |
+| `done` | session ids you marked done |
 | `terminal_zoom` | terminal text scale |
 | `sidebar_zoom` | session list text scale |
 
