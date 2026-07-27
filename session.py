@@ -7,8 +7,10 @@ import subprocess
 import gi
 
 gi.require_version("Vte", "3.91")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 
-from gi.repository import Gio, GLib, Vte
+from gi.repository import Gdk, Gio, GLib, Gtk, Vte
 
 # We launch through an interactive bash so the user's ~/.bashrc is sourced
 # (PATH, nvm), then `exec` so bash REPLACES itself with claude. That matters:
@@ -46,6 +48,21 @@ def marker_unset_prefix():
     if not markers:
         return ""
     return "unset " + " ".join(markers) + "; "
+
+
+# Clickable links. A bare VTE does none of this -- GNOME Terminal implements it
+# on top, which is why links were dead here. Two separate mechanisms:
+#   * OSC 8 hyperlinks, where the program explicitly marks text as a link
+#   * a regex over the visible text, for plain URLs that were merely printed
+# PCRE2 flags, since Vte.Regex takes them numerically.
+PCRE2_CASELESS = 0x00000008
+PCRE2_MULTILINE = 0x00000400
+URL_PATTERN = (
+    r"(?:https?://|ftp://|file://|www\.)"
+    r"[^\s\"'<>`{}|\\^\[\]]+"
+)
+# Trailing punctuation is almost never part of the URL -- "see https://x.com."
+_TRAILING = ".,;:!?)]}'\"…"
 
 
 def _parent_pid(pid):
@@ -133,6 +150,74 @@ class TerminalSession:
         self._child_exited_id = self.terminal.connect(
             "child-exited", self._on_child_exited
         )
+        self._enable_links()
+
+    # -- clickable links ---------------------------------------------------
+
+    def _enable_links(self):
+        """Ctrl+click to open URLs, and honour OSC 8 hyperlinks."""
+        try:
+            self.terminal.set_allow_hyperlink(True)
+        except Exception:
+            pass
+        try:
+            regex = Vte.Regex.new_for_match(
+                URL_PATTERN, -1, PCRE2_MULTILINE | PCRE2_CASELESS
+            )
+            self._url_tag = self.terminal.match_add_regex(regex, 0)
+            self.terminal.match_set_cursor_name(self._url_tag, "pointer")
+        except Exception:
+            self._url_tag = -1
+
+        click = Gtk.GestureClick(button=0)
+        click.connect("released", self._on_click)
+        self.terminal.add_controller(click)
+
+    def link_at(self, x, y):
+        """An OSC 8 hyperlink or a matched URL under the pointer, if any."""
+        try:
+            uri = self.terminal.check_hyperlink_at(x, y)
+            if uri:
+                return uri
+        except Exception:
+            pass
+        try:
+            match, _tag = self.terminal.check_match_at(x, y)
+        except Exception:
+            return None
+        if not match:
+            return None
+        match = match.rstrip(_TRAILING)
+        if match.lower().startswith("www."):
+            match = "https://" + match
+        return match or None
+
+    def _on_click(self, gesture, n_press, x, y):
+        state = gesture.get_current_event_state()
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        # Left button only. NOT middle: middle-click pastes the primary
+        # selection, and opening a browser as well would be a nasty surprise.
+        if gesture.get_current_button() != 1:
+            return
+        uri = self.link_at(x, y)
+        if not uri:
+            return
+        explicit = False
+        try:
+            explicit = bool(self.terminal.check_hyperlink_at(x, y))
+        except Exception:
+            pass
+        # Ctrl+click for a plain URL; a bare click is enough for an explicit
+        # OSC 8 hyperlink -- same as GNOME Terminal.
+        if not (ctrl or explicit):
+            return
+        try:
+            Gtk.UriLauncher.new(uri=uri).launch(None, None, None, None)
+        except Exception:
+            try:
+                Gio.AppInfo.launch_default_for_uri(uri, None)
+            except Exception:
+                pass
 
     # -- lifecycle ---------------------------------------------------------
 
