@@ -43,6 +43,16 @@ Nothing surfaces it. This does.
 - **Two list orders**: automatic (waiting sessions rise to the top by
   themselves) or static, where you drag rows into the order you want and
   nothing moves on its own.
+- **Stories**: related sessions fold under one header with a ▸/▾ arrow and a
+  one-line sum of their states ("1 needs you · 3 busy"). A folded story still
+  lights up when a session inside it waits on you. Sessions get into a story
+  three ways: a session started by another session (via `cc-sessions-start`)
+  joins its starter's story automatically; sessions named alike
+  (`AT-43-backend`, `AT-43-pwa`) group under their shared prefix (switchable
+  in Settings); and by hand -- right-click a session for *Move to…*, *New
+  story…*, *Take out of…*, right-click a header to rename or ungroup, or (in
+  the static order) drag a session onto a header or among a story's rows.
+  Closing a session takes it out of its story; an emptied story disappears.
 
 ## Install
 

@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import sys
+import time
 
 # Force GTK4's software renderer BEFORE gi/Gtk is imported.
 #
@@ -32,6 +33,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Vte
 
 import roster
 import state
+import stories
 from session import TerminalSession, default_session_name
 from theme import TerminalTheme
 
@@ -217,6 +219,46 @@ class NewSessionDialog(Gtk.Window):
         self.on_accept(name, cwd, mode)
 
 
+class NameDialog(Gtk.Window):
+    """Ask for one line of text: a story's name."""
+
+    def __init__(self, parent, title, label, text, on_accept, button="Save"):
+        super().__init__(title=title, transient_for=parent, modal=True)
+        self.on_accept = on_accept
+        self.set_default_size(420, -1)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for setter in ("set_margin_top", "set_margin_bottom",
+                       "set_margin_start", "set_margin_end"):
+            getattr(box, setter)(16)
+
+        box.append(Gtk.Label(label=label, xalign=0))
+        self.entry = Gtk.Entry()
+        self.entry.set_text(text or "")
+        self.entry.connect("activate", lambda *_: self._accept())
+        box.append(self.entry)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.close())
+        ok = Gtk.Button(label=button)
+        ok.add_css_class("suggested-action")
+        ok.connect("clicked", lambda *_: self._accept())
+        buttons.append(cancel)
+        buttons.append(ok)
+        box.append(buttons)
+        self.set_child(box)
+        self.entry.grab_focus()
+
+    def _accept(self):
+        text = self.entry.get_text().strip()
+        if not text:
+            return
+        self.close()
+        self.on_accept(text)
+
+
 class FolderRow(Gtk.Box):
     """Folder entry + Home shortcut + Browse, reused by both dialogs."""
 
@@ -320,6 +362,29 @@ class SettingsDialog(Gtk.Window):
         )
         sort_row.append(self.sort_switch)
         box.append(sort_row)
+
+        prefix_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        prefix_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        prefix_text.set_hexpand(True)
+        prefix_text.append(Gtk.Label(label="Group sessions named alike", xalign=0))
+        prefix_hint = Gtk.Label(xalign=0)
+        prefix_hint.set_markup(
+            "<span alpha='55%'>On: “AT-43-backend” and “AT-43-pwa” sit together "
+            "in a story called AT-43.  Stories you make by hand, and sessions "
+            "started by another session, are grouped either way.</span>"
+        )
+        prefix_hint.set_wrap(True)
+        prefix_text.append(prefix_hint)
+        prefix_row.append(prefix_text)
+        self.prefix_switch = Gtk.Switch()
+        self.prefix_switch.set_valign(Gtk.Align.CENTER)
+        self.prefix_switch.set_active(app.story_by_prefix())
+        self.prefix_switch.connect(
+            "notify::active",
+            lambda sw, _p: app.set_story_by_prefix(sw.get_active()),
+        )
+        prefix_row.append(self.prefix_switch)
+        box.append(prefix_row)
 
         box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
@@ -446,6 +511,23 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         self._rows = []
         self._last_signature = None
+        # A right-click menu is parented to its row; rebuilding the list under
+        # an open menu would pull the row out from beneath it. So the list
+        # holds still while a menu is open.
+        self._menu_open = False
+        self._story_members = {}     # story id -> member keys, as last drawn
+        for name, handler in (
+            ("story-new", self._story_new),
+            ("story-add", self._story_add),
+            ("story-remove", self._story_remove),
+            ("story-rename", self._story_rename),
+            ("story-ungroup", self._story_ungroup),
+            ("story-toggle", self._story_toggle),
+        ):
+            action = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+            action.connect("activate",
+                           lambda _a, param, h=handler: h(param.get_string()))
+            self.add_action(action)
         if restorable:
             self.app.add_pending(restorable)
 
@@ -817,6 +899,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         return row
 
     def dismiss_restorable(self, record):
+        self.app.forget_key(item_key("record", record))
         self.app.drop_pending(record)
 
     def resume_restorable(self, record):
@@ -980,8 +1063,12 @@ class SessionWindow(Gtk.ApplicationWindow):
         def dropped(_t, value, _x, _y, key=row.item_key):
             if not isinstance(value, str) or not value or value == key:
                 return False
+            # Where you drop it is where it lives: among a story's rows it
+            # joins that story, among loose rows it leaves its story.
+            self.app.follow_story(value, key, self._story_members)
             self.app.move_in_order(value, key,
-                                   [r.item_key for r in self._rows])
+                                   [r.item_key for r in self._rows
+                                    if getattr(r, "item_key", None)])
             return True
 
         target.connect("drop", dropped)
@@ -1006,6 +1093,8 @@ class SessionWindow(Gtk.ApplicationWindow):
                 label.set_label(text)
 
     def refresh(self, entries=None):
+        if self._menu_open:
+            return
         if entries is None:
             entries = roster.read()
             self.app.update_attention(entries)
@@ -1050,7 +1139,9 @@ class SessionWindow(Gtk.ApplicationWindow):
                            for s in local_only),
                      tuple((s.key, s.current_cwd()) for s in self.app.sessions
                            if self.owns(s)),
-                     tuple(r.get("session_id") or r.get("name") for r in self.restorable))
+                     tuple(r.get("session_id") or r.get("name") for r in self.restorable),
+                     self.app.stories_signature(),
+                     tuple(self._item_name(i) for i in items))
         if signature == self._last_signature:
             return
         self._last_signature = signature
@@ -1065,7 +1156,22 @@ class SessionWindow(Gtk.ApplicationWindow):
         self._rows = []
 
         manual = not self.app.auto_sort()
-        for kind, obj, owned in items:
+        blocks = stories.group(
+            items,
+            key_of=lambda i: item_key(*i),
+            name_of=self._item_name,
+            story_of=self.app.story_of(),
+            stories=self.app.stories(),
+            use_prefix=self.app.story_by_prefix(),
+            ignored_prefixes=self.app.ignored_prefixes(),
+        )
+        self._story_members = {
+            block[1]["id"]: [item_key(*i) for i in block[2]]
+            for block in blocks if block[0] == "story"
+        }
+
+        def add_item(item, child=False):
+            kind, obj, owned = item
             if kind == "entry":
                 row = self._make_row(obj, owned, self.app.attention_kind(obj))
             elif kind == "record":
@@ -1073,16 +1179,241 @@ class SessionWindow(Gtk.ApplicationWindow):
             else:
                 row = self._make_local_row(obj)
             row.item_key = item_key(kind, obj, owned)
+            row.story_id = None
+            if child:
+                row.get_child().add_css_class("ccs-row-child")
             if manual:
                 self._attach_reorder(row)
+            self._attach_menu(row, lambda key=row.item_key: self._session_menu(key))
             self.listbox.append(row)
             self._rows.append(row)
             if owned is not None and owned.terminal is selected:
                 self.listbox.select_row(row)
 
+        for block in blocks:
+            if block[0] == "item":
+                add_item(block[1])
+                continue
+            _, story, members = block
+            collapsed = self.app.story_collapsed(story["id"])
+            header = self._make_story_row(story, members, collapsed)
+            self.listbox.append(header)
+            self._rows.append(header)
+            if not collapsed:
+                for item in members:
+                    add_item(item, child=True)
+
+    # -- stories -----------------------------------------------------------
+
+    @staticmethod
+    def _item_name(item):
+        kind, obj, _owned = item
+        if kind == "record":
+            return obj.get("name") or ""
+        return obj.name or ""
+
+    def _member_state(self, item):
+        """One word per member, for the story's summary line."""
+        kind, obj, owned = item
+        if kind == "record":
+            return "dormant"
+        if kind == "local":
+            if obj.exited:
+                return "ended"
+            return "terminal" if obj.mode == "shell" else "busy"
+        key = item_key(kind, obj, owned)
+        if obj.status == "idle" and self.app.is_done(key):
+            return "done"
+        attention = self.app.attention_kind(obj)
+        if obj.status == "waiting" or attention == "blocked":
+            return "blocked"
+        if attention == "finished":
+            return "finished"
+        if obj.status in ("busy", "shell"):
+            return "busy"
+        return "idle"
+
+    def _make_story_row(self, story, members, collapsed):
+        """The header of a story: arrow, name, count, and a one-line sum.
+
+        Collapsed or not, the sum and its colour cover every member -- so a
+        session waiting on you inside a folded story still lights the header.
+        """
+        row = Gtk.ListBoxRow()
+        row.entry = None
+        row.session = None
+        row.story = story
+        row.item_key = None
+
+        states = [self._member_state(item) for item in members]
+        colour, summary = stories.summarize(states)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.add_css_class("ccs-row")
+        box.add_css_class("ccs-story")
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        arrow = Gtk.Label(label="▸" if collapsed else "▾")
+        arrow.add_css_class("ccs-story-arrow")
+        top.append(arrow)
+
+        name = Gtk.Label(label=story["name"], xalign=0)
+        name.set_hexpand(True)
+        name.set_ellipsize(3)
+        name.add_css_class("ccs-story-name")
+        if "blocked" in states:
+            name.add_css_class("ccs-attention")
+        top.append(name)
+
+        count = Gtk.Label(label=str(len(members)), xalign=1)
+        count.add_css_class("ccs-age")
+        top.append(count)
+        box.append(top)
+
+        line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dot = Gtk.Label(label="●" if colour in ("waiting", "finished") else "■")
+        dot.add_css_class("ccs-dot")
+        dot.add_css_class("ccs-dot-%s" % colour)
+        line.append(dot)
+        sub = Gtk.Label(label=summary, xalign=0)
+        sub.set_hexpand(True)
+        sub.set_ellipsize(3)
+        sub.add_css_class("ccs-sub")
+        sub.add_css_class("ccs-sub-%s" % colour)
+        line.append(sub)
+        box.append(line)
+
+        kind = ("grouped by name" if story.get("virtual") else "story")
+        row.set_tooltip_text("%s  (%s)\nClick to %s.  Right-click for more." % (
+            story["name"], kind, "expand" if collapsed else "collapse"))
+
+        row.set_child(box)
+
+        # Drop a session on the header to put it in this story.
+        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+
+        def dropped(_t, value, _x, _y, sid=story["id"]):
+            if not isinstance(value, str) or not value:
+                return False
+            self.app.add_to_story(value, sid, self._story_members.get(sid, ()))
+            return True
+
+        target.connect("drop", dropped)
+        row.add_controller(target)
+
+        self._attach_menu(row, lambda sid=story["id"]: self._story_menu(sid))
+        return row
+
+    def _attach_menu(self, row, build):
+        """Right-click on a row opens the menu `build()` returns."""
+        click = Gtk.GestureClick(button=3)
+
+        def pressed(_gesture, _n, x, y):
+            menu = build()
+            if menu is None:
+                return
+            popover = Gtk.PopoverMenu.new_from_model(menu)
+            popover.set_has_arrow(False)
+            popover.set_parent(row)
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            popover.set_pointing_to(rect)
+            self._menu_open = True
+
+            def closed(pop):
+                # Let the chosen action run first, then let the list move.
+                def after():
+                    pop.unparent()
+                    self._menu_open = False
+                    self._last_signature = None
+                    self.refresh()
+                    return False
+                GLib.idle_add(after)
+
+            popover.connect("closed", closed)
+            popover.popup()
+
+        click.connect("pressed", pressed)
+        row.add_controller(click)
+
+    @staticmethod
+    def _menu_item(label, action, value):
+        item = Gio.MenuItem.new(label, None)
+        item.set_action_and_target_value("win." + action, GLib.Variant("s", value))
+        return item
+
+    def _session_menu(self, key):
+        if not key:
+            return None
+        current = self.app.story_of().get(key)
+        story_names = {s["id"]: s["name"] for s in self.app.stories()}
+        menu = Gio.Menu()
+
+        moves = Gio.Menu()
+        for sid, name in story_names.items():
+            if sid != current:
+                moves.append_item(self._menu_item(
+                    "Move to “%s”" % name, "story-add", "%s\t%s" % (key, sid)))
+        if moves.get_n_items():
+            menu.append_section(None, moves)
+
+        rest = Gio.Menu()
+        rest.append_item(self._menu_item("New story with this session…",
+                                         "story-new", key))
+        if current in story_names:
+            rest.append_item(self._menu_item(
+                "Take out of “%s”" % story_names[current], "story-remove", key))
+        menu.append_section(None, rest)
+        return menu
+
+    def _story_menu(self, sid):
+        menu = Gio.Menu()
+        collapsed = self.app.story_collapsed(sid)
+        menu.append_item(self._menu_item("Expand" if collapsed else "Collapse",
+                                         "story-toggle", sid))
+        menu.append_item(self._menu_item("Rename…", "story-rename", sid))
+        menu.append_item(self._menu_item(
+            "Stop grouping by this name" if stories.is_virtual(sid) else "Ungroup",
+            "story-ungroup", sid))
+        return menu
+
+    def _story_name(self, sid):
+        if stories.is_virtual(sid):
+            return sid[len(stories.PREFIX_ID):]
+        for story in self.app.stories():
+            if story["id"] == sid:
+                return story["name"]
+        return ""
+
+    def _story_new(self, key):
+        NameDialog(self, "New story", "Story name", "",
+                   lambda name: self.app.create_story(name, [key]),
+                   button="Create").present()
+
+    def _story_add(self, payload):
+        key, _, sid = payload.partition("\t")
+        self.app.add_to_story(key, sid, self._story_members.get(sid, ()))
+
+    def _story_remove(self, key):
+        self.app.assign_story(key, None)
+
+    def _story_rename(self, sid):
+        members = list(self._story_members.get(sid, ()))
+        NameDialog(self, "Rename story", "Story name", self._story_name(sid),
+                   lambda name: self.app.rename_story(sid, name, members)).present()
+
+    def _story_ungroup(self, sid):
+        self.app.ungroup_story(sid)
+
+    def _story_toggle(self, sid):
+        self.app.toggle_story(sid)
+
     # -- actions -----------------------------------------------------------
 
     def _on_row_activated(self, listbox, row):
+        if getattr(row, "story", None) is not None:
+            self.app.toggle_story(row.story["id"])
+            return
         if getattr(row, "record", None) is not None:
             self.resume_restorable(row.record)
             return
@@ -1225,6 +1556,9 @@ class CCSessions(Gtk.Application):
         #   mode   -- "claude" or "shell"                    default: "claude"
         #   focus  -- switch the window to it                default: False, so a
         #             script never yanks you out of the session you're typing in
+        #   parent -- Claude session id of the session asking  default: none.
+        #             The new session joins that session's story (one is
+        #             created, named after it, if it has none yet).
         # Use the cc-sessions-start helper rather than raw gdbus.
         action = Gio.SimpleAction.new("start-session", GLib.VariantType.new("a{sv}"))
         action.connect("activate", self._on_start_session_action)
@@ -1323,6 +1657,11 @@ class CCSessions(Gtk.Application):
             # Seat it in the window straight away: a live VTE left without a
             # parent segfaults (see SessionWindow.unassigned).
             window.stack.add_named(sess.terminal, sess.key)
+        # Only AFTER seating it: joining a story refreshes the list, and a
+        # refresh adopts any unseated terminal -- seating it twice.
+        parent = options.get("parent")
+        if isinstance(parent, str) and parent:
+            self.join_parent_story(parent, "local:" + sess.key)
         window._last_signature = None
         window.refresh()
 
@@ -1420,19 +1759,29 @@ class CCSessions(Gtk.Application):
         self.config["manual_order"] = order
         save_config(self.config)
 
-    def rename_order_key(self, old_key, new_key):
-        """Follow a row whose identity changed, keeping its position.
+    def rename_key(self, old_key, new_key):
+        """Follow a row whose identity changed, keeping its place and story.
 
         A session is 'local:session-3' until Claude registers it, then it
-        becomes its session id. Without this the row would look brand new a few
-        seconds after starting and jump to the bottom of a manual list.
+        becomes its session id -- and /clear gives it a new id again. Without
+        this the row would look brand new: it would jump to the bottom of a
+        manual list and fall out of its story.
         """
-        order = self.manual_order()
-        if old_key not in order or new_key in order:
+        if not old_key or not new_key or old_key == new_key:
             return
-        order[order.index(old_key)] = new_key
-        self.config["manual_order"] = order
-        save_config(self.config)
+        changed = False
+        order = self.manual_order()
+        if old_key in order and new_key not in order:
+            order[order.index(old_key)] = new_key
+            self.config["manual_order"] = order
+            changed = True
+        story_of = self.story_of()
+        if old_key in story_of and new_key not in story_of:
+            story_of[new_key] = story_of.pop(old_key)
+            self.config["story_of"] = story_of
+            changed = True
+        if changed:
+            save_config(self.config)
 
     def move_in_order(self, src_key, dst_key, seed_keys=()):
         """Put src_key where dst_key is, and remember it."""
@@ -1452,6 +1801,196 @@ class CCSessions(Gtk.Application):
         for window in self.session_windows():
             window._last_signature = None
             window.refresh()
+
+    # -- stories -----------------------------------------------------------
+    #
+    # Saved in config.json:
+    #   stories          [{"id", "name"}]        the stories you have
+    #   story_of         {row key: story id}     who is in which
+    #   story_collapsed  {story id: true}        folded ones (by-name ones too)
+    #   story_by_prefix  bool                    group sessions named alike
+    #   story_prefix_off [prefix]                name families you un-grouped
+
+    def stories(self):
+        raw = self.config.get("stories")
+        if not isinstance(raw, list):
+            return []
+        return [s for s in raw
+                if isinstance(s, dict) and s.get("id") and s.get("name")]
+
+    def story_of(self):
+        raw = self.config.get("story_of")
+        known = {s["id"] for s in self.stories()}
+        if not isinstance(raw, dict):
+            return {}
+        return {k: v for k, v in raw.items() if v in known}
+
+    def story_collapsed(self, sid):
+        raw = self.config.get("story_collapsed")
+        return isinstance(raw, dict) and bool(raw.get(sid))
+
+    def story_by_prefix(self):
+        return bool(self.config.get("story_by_prefix", True))
+
+    def set_story_by_prefix(self, enabled):
+        self.config["story_by_prefix"] = bool(enabled)
+        self._stories_changed()
+
+    def ignored_prefixes(self):
+        raw = self.config.get("story_prefix_off")
+        return [p for p in raw if isinstance(p, str)] if isinstance(raw, list) else []
+
+    def stories_signature(self):
+        """Everything about stories that changes what the list looks like."""
+        return json.dumps([self.stories(), self.story_of(),
+                           self.config.get("story_collapsed"),
+                           self.story_by_prefix(), self.ignored_prefixes()],
+                          sort_keys=True)
+
+    def _stories_changed(self):
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
+    def _save_stories(self, stories_list, story_of):
+        # Drop stories nobody is in any more, and their folded flag.
+        used = set(story_of.values())
+        kept = [s for s in stories_list if s["id"] in used]
+        self.config["stories"] = kept
+        self.config["story_of"] = story_of
+        collapsed = self.config.get("story_collapsed")
+        if isinstance(collapsed, dict):
+            ids = {s["id"] for s in kept}
+            self.config["story_collapsed"] = {
+                k: v for k, v in collapsed.items()
+                if v and (k in ids or stories.is_virtual(k))
+            }
+
+    def create_story(self, name, keys):
+        sid = "s%d" % int(time.time() * 1000)
+        while any(s["id"] == sid for s in self.stories()):
+            sid += "x"
+        story_of = self.story_of()
+        for key in keys:
+            if key:
+                story_of[key] = sid
+        self._save_stories(self.stories() + [{"id": sid, "name": name}], story_of)
+        self._stories_changed()
+        return sid
+
+    def materialize(self, sid, member_keys, name=None):
+        """Turn a by-name story into a saved one, members and fold included.
+
+        Needed as soon as you touch a by-name story: rename it, or drop
+        something into it that does not share its name.
+        """
+        if not stories.is_virtual(sid):
+            return sid
+        collapsed = self.story_collapsed(sid)
+        new_sid = self.create_story(name or sid[len(stories.PREFIX_ID):],
+                                    list(member_keys))
+        if collapsed:
+            self.config.setdefault("story_collapsed", {})[new_sid] = True
+        self._stories_changed()
+        return new_sid
+
+    def assign_story(self, key, sid):
+        """Put one row in a saved story, or (sid None) take it out."""
+        if not key:
+            return
+        story_of = self.story_of()
+        if sid:
+            story_of[key] = sid
+        else:
+            story_of.pop(key, None)
+        self._save_stories(self.stories(), story_of)
+        self._stories_changed()
+
+    def add_to_story(self, key, sid, member_keys=()):
+        if stories.is_virtual(sid):
+            sid = self.materialize(sid, member_keys)
+        self.assign_story(key, sid)
+
+    def follow_story(self, src_key, dst_key, members_by_story):
+        """A row dragged onto another takes on that row's saved story."""
+        story_of = self.story_of()
+        dst_sid = story_of.get(dst_key)
+        if dst_sid is None:
+            for sid, keys in members_by_story.items():
+                if dst_key in keys and stories.is_virtual(sid):
+                    if src_key not in keys:
+                        dst_sid = self.materialize(sid, keys)
+                    break
+        if dst_sid is not None:
+            if story_of.get(src_key) != dst_sid:
+                self.assign_story(src_key, dst_sid)
+        elif src_key in story_of:
+            self.assign_story(src_key, None)
+
+    def rename_story(self, sid, name, member_keys=()):
+        if stories.is_virtual(sid):
+            self.materialize(sid, member_keys, name=name)
+            return
+        updated = [dict(s, name=name) if s["id"] == sid else s
+                   for s in self.stories()]
+        self.config["stories"] = updated
+        self._stories_changed()
+
+    def ungroup_story(self, sid):
+        """Let a story's sessions go back to being loose rows."""
+        if stories.is_virtual(sid):
+            prefix = sid[len(stories.PREFIX_ID):]
+            off = self.ignored_prefixes()
+            if prefix not in off:
+                off.append(prefix)
+            self.config["story_prefix_off"] = off
+            self._stories_changed()
+            return
+        story_of = {k: v for k, v in self.story_of().items() if v != sid}
+        self._save_stories(self.stories(), story_of)
+        self._stories_changed()
+
+    def toggle_story(self, sid):
+        collapsed = self.config.get("story_collapsed")
+        if not isinstance(collapsed, dict):
+            collapsed = {}
+        if collapsed.get(sid):
+            collapsed.pop(sid, None)
+        else:
+            collapsed[sid] = True
+        self.config["story_collapsed"] = collapsed
+        self._stories_changed()
+
+    def forget_key(self, key):
+        story_of = self.story_of()
+        if key in story_of:
+            story_of.pop(key)
+            self._save_stories(self.stories(), story_of)
+            save_config(self.config)
+
+    def join_parent_story(self, parent_id, child_key):
+        """A session started by another one joins the starter's story.
+
+        If the starter is not in a saved story yet, one is made for it, named
+        after it, with the starter as its first member -- so an orchestrator
+        and everything it starts fold away together.
+        """
+        story_of = self.story_of()
+        sid = story_of.get(parent_id)
+        if sid is None:
+            name = None
+            for sess in self.sessions:
+                if sess.session_id == parent_id:
+                    name = sess.name
+                    break
+            if name is None:
+                for entry in roster.read():
+                    if entry.session_id == parent_id:
+                        name = entry.name
+                        break
+            sid = self.create_story(name or "story", [parent_id])
+        self.assign_story(child_key, sid)
 
     # -- zoom --------------------------------------------------------------
 
@@ -1616,6 +2155,8 @@ class CCSessions(Gtk.Application):
                 pass
         if sess in self.sessions:
             self.sessions.remove(sess)
+        # Closed on purpose: it leaves its story (and an emptied story goes).
+        self.forget_key(item_key("local", sess, sess))
         # Hold the widget alive past this call so VTE can finish with the pty
         # on its own schedule rather than during garbage collection.
         self._retired.append(sess)
@@ -1682,10 +2223,11 @@ class CCSessions(Gtk.Application):
         for entry in entries:
             sess = self.session_for_entry(entry)
             if sess is not None:
-                if entry.session_id and not sess.session_id:
+                if entry.session_id and entry.session_id != sess.session_id:
                     # Its row identity is about to change; carry its manual
-                    # position across so it does not jump to the bottom.
-                    self.rename_order_key("local:" + sess.key, entry.session_id)
+                    # position and its story across.
+                    self.rename_key(sess.session_id or ("local:" + sess.key),
+                                    entry.session_id)
                 sess.session_id = entry.session_id
                 sess.last_status = entry.status
                 # Where Claude actually is, which may not be where this
@@ -1764,6 +2306,21 @@ class CCSessions(Gtk.Application):
                 min-width: 0; min-height: 0; opacity: 0.55;
             }}
             .ccs-close:hover {{ color: {attn}; opacity: 1; background: transparent; }}
+            .ccs-story {{ padding-left: 8px; }}
+            .ccs-story-arrow {{
+                color: {dim}; font-family: {font}; font-size: {s_name};
+                min-width: 1em;
+            }}
+            .ccs-story-name {{
+                color: {fg}; font-family: {font}; font-size: {s_name};
+                font-weight: bold;
+            }}
+            /* Members hang off their story: indented, with a faint rail on
+               the left that ties them to the header above. */
+            .ccs-row.ccs-row-child {{
+                margin-left: 14px; padding-left: 12px;
+                border-left: 2px solid alpha({dim}, 0.35);
+            }}
             """.format(
                 bg=theme.bg_css,
                 fg=theme.fg_css,

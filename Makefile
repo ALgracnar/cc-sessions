@@ -18,7 +18,7 @@ LIBDIR      = $(PREFIX)/share/cc-sessions
 DESKTOPDIR  = $(PREFIX)/share/applications
 ICONDIR     = $(PREFIX)/share/icons/hicolor/scalable/apps
 
-SOURCES     = cc-sessions.py roster.py session.py state.py theme.py
+SOURCES     = cc-sessions.py roster.py session.py state.py stories.py theme.py
 
 .PHONY: all install uninstall deb check clean
 

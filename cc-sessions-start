@@ -9,9 +9,14 @@
 The session gets the same claude command and flags as the "+" button
 (Settings, e.g. --dangerously-skip-permissions). A taken name gets -2, -3...
 Without --focus your current view is left alone.
+
+Run from inside a Claude session, the new session joins that session's story
+in the sidebar (found by walking up the process tree). --no-story turns that
+off; --parent <session id> names the starter explicitly.
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -20,6 +25,49 @@ from gi.repository import Gio, GLib
 
 APP_ID = "eu.nevron.ccsessions"
 OBJECT_PATH = "/eu/nevron/ccsessions"
+
+
+ROSTER_DIR = os.path.expanduser("~/.claude/sessions")
+
+
+def _stat_fields(pid):
+    """/proc/<pid>/stat after the command name, which may hold spaces."""
+    with open("/proc/%d/stat" % pid, "rb") as handle:
+        data = handle.read()
+    return data[data.rfind(b")") + 2:].split()
+
+
+def calling_session():
+    """The Claude session id of whoever ran us, or None.
+
+    Claude writes ~/.claude/sessions/<pid>.json for each running session, so
+    the first ancestor process with such a file is the session asking. Its
+    recorded start time must match the live process, so a stale file left by a
+    recycled pid is never mistaken for it.
+    """
+    pid = os.getppid()
+    for _ in range(40):
+        if pid <= 1:
+            return None
+        try:
+            fields = _stat_fields(pid)
+        except (OSError, IndexError):
+            return None
+        try:
+            with open(os.path.join(ROSTER_DIR, "%d.json" % pid), "r",
+                      encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("sessionId"):
+            recorded = data.get("procStart")
+            if not recorded or str(recorded) == fields[19].decode():
+                return data["sessionId"]
+        try:
+            pid = int(fields[1])
+        except (IndexError, ValueError):
+            return None
+    return None
 
 
 def main():
@@ -31,6 +79,11 @@ def main():
     prompt.add_argument("--prompt-file", help="read the first message from a file")
     parser.add_argument("--shell", action="store_true", help="plain terminal, not claude")
     parser.add_argument("--focus", action="store_true", help="switch the window to it")
+    story = parser.add_mutually_exclusive_group()
+    story.add_argument("--parent", help="Claude session id whose story to join "
+                                        "(default: the session running this)")
+    story.add_argument("--no-story", action="store_true",
+                       help="do not join the calling session's story")
     args = parser.parse_args()
 
     options = {}
@@ -48,6 +101,9 @@ def main():
         options["mode"] = GLib.Variant("s", "shell")
     if args.focus:
         options["focus"] = GLib.Variant("b", True)
+    parent = None if args.no_story else (args.parent or calling_session())
+    if parent:
+        options["parent"] = GLib.Variant("s", parent)
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     try:
