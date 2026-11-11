@@ -1216,6 +1216,20 @@ class CCSessions(Gtk.Application):
             self.add_action(action)
             self.set_accels_for_action("app.%s" % name, accels)
 
+        # The API: start a named session from outside, exactly as the "+"
+        # button would (same claude command, same configured flags such as
+        # --dangerously-skip-permissions). Parameter is a dict:
+        #   name   -- session name (made unique if taken)    default: from folder
+        #   cwd    -- folder to start in                     default: Settings folder
+        #   prompt -- first message to send it               default: none
+        #   mode   -- "claude" or "shell"                    default: "claude"
+        #   focus  -- switch the window to it                default: False, so a
+        #             script never yanks you out of the session you're typing in
+        # Use the cc-sessions-start helper rather than raw gdbus.
+        action = Gio.SimpleAction.new("start-session", GLib.VariantType.new("a{sv}"))
+        action.connect("activate", self._on_start_session_action)
+        self.add_action(action)
+
         GLib.timeout_add(1000, self._tick)
 
     def do_activate(self):
@@ -1280,6 +1294,37 @@ class CCSessions(Gtk.Application):
                 record.setdefault("window", slot)
         for records in saved:
             self.new_window(restorable=records)
+
+    def _on_start_session_action(self, _action, parameter):
+        options = parameter.unpack() if parameter is not None else {}
+        mode = options.get("mode") or "claude"
+        if mode not in ("claude", "shell"):
+            print("[cc-sessions] start-session: unknown mode %r" % mode, file=sys.stderr)
+            return
+        cwd = os.path.expanduser(options.get("cwd") or "") or self.default_folder()
+        if not os.path.isdir(cwd):
+            print("[cc-sessions] start-session: no such folder %r" % cwd, file=sys.stderr)
+            return
+        name = self.unique_name(options.get("name") or default_session_name(cwd))
+
+        window = self.get_active_window()
+        if not isinstance(window, SessionWindow):
+            windows = self.session_windows()
+            window = windows[0] if windows else None
+        if window is None:
+            window = SessionWindow(self)
+            window.present()
+
+        sess = self.start_session(name=name, cwd=cwd, mode=mode,
+                                  prompt=options.get("prompt") or None)
+        if options.get("focus"):
+            window.show_session(sess)
+        else:
+            # Seat it in the window straight away: a live VTE left without a
+            # parent segfaults (see SessionWindow.unassigned).
+            window.stack.add_named(sess.terminal, sess.key)
+        window._last_signature = None
+        window.refresh()
 
     def _new_session_here(self):
         window = self.get_active_window()
@@ -1461,11 +1506,11 @@ class CCSessions(Gtk.Application):
             index += 1
         return "%s-%d" % (base, index)
 
-    def start_session(self, name, cwd, mode="claude", resume_id=None):
+    def start_session(self, name, cwd, mode="claude", resume_id=None, prompt=None):
         sess = TerminalSession(
             self.theme, cwd=cwd, name=name, mode=mode,
             command=self.claude_command(), extra_args=self.claude_args(),
-            zoom=self.terminal_zoom(), resume_id=resume_id,
+            zoom=self.terminal_zoom(), resume_id=resume_id, prompt=prompt,
         )
         sess.spawn()
         self.sessions.append(sess)

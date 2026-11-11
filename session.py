@@ -127,7 +127,8 @@ class TerminalSession:
     _counter = 0
 
     def __init__(self, theme, cwd=None, name=None, on_exit=None, mode="claude",
-                 command="claude", extra_args="", zoom=1.0, resume_id=None):
+                 command="claude", extra_args="", zoom=1.0, resume_id=None,
+                 prompt=None):
         TerminalSession._counter += 1
         self.key = "session-%d" % TerminalSession._counter
         self.cwd = cwd or os.path.expanduser("~")
@@ -136,6 +137,7 @@ class TerminalSession:
         self.command = command or "claude"
         self.extra_args = extra_args or ""
         self.resume_id = resume_id       # resume this conversation, if given
+        self.prompt = prompt             # first message, sent once at launch
         self.session_id = None           # learned from the roster once running
         self.roster_cwd = None           # Claude's real cwd, once known
         self.last_status = None
@@ -248,6 +250,10 @@ class TerminalSession:
             # "--dangerously-skip-permissions"), and quoting it would turn the
             # whole thing into a single meaningless argument.
             pieces = ["-n", shlex.quote(self.name)]
+            if self.prompt:
+                # FIRST, before extra_args: a variadic flag there (--add-dir)
+                # would otherwise swallow the prompt as one more value.
+                pieces.insert(0, shlex.quote(self.prompt))
             if self.resume_id:
                 # Pick the conversation back up rather than starting fresh.
                 pieces += ["-r", shlex.quote(self.resume_id)]

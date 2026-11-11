@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Start a session in the running cc-sessions app -- same as clicking "+".
+
+  cc-sessions-start --name my-task
+  cc-sessions-start --name my-task --cwd ~/nevron-core --prompt "read /path/note.md"
+  cc-sessions-start --name my-task --prompt-file /path/note.md --focus
+  cc-sessions-start --name scratch --shell
+
+The session gets the same claude command and flags as the "+" button
+(Settings, e.g. --dangerously-skip-permissions). A taken name gets -2, -3...
+Without --focus your current view is left alone.
+"""
+
+import argparse
+import os
+import sys
+
+import gi
+from gi.repository import Gio, GLib
+
+APP_ID = "eu.nevron.ccsessions"
+OBJECT_PATH = "/eu/nevron/ccsessions"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--name", help="session name")
+    parser.add_argument("--cwd", help="folder to start in (default: Settings folder)")
+    prompt = parser.add_mutually_exclusive_group()
+    prompt.add_argument("--prompt", help="first message to send the session")
+    prompt.add_argument("--prompt-file", help="read the first message from a file")
+    parser.add_argument("--shell", action="store_true", help="plain terminal, not claude")
+    parser.add_argument("--focus", action="store_true", help="switch the window to it")
+    args = parser.parse_args()
+
+    options = {}
+    if args.name:
+        options["name"] = GLib.Variant("s", args.name)
+    if args.cwd:
+        options["cwd"] = GLib.Variant("s", os.path.abspath(os.path.expanduser(args.cwd)))
+    text = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    if text:
+        options["prompt"] = GLib.Variant("s", text)
+    if args.shell:
+        options["mode"] = GLib.Variant("s", "shell")
+    if args.focus:
+        options["focus"] = GLib.Variant("b", True)
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    try:
+        bus.call_sync(
+            APP_ID, OBJECT_PATH, "org.gtk.Actions", "Activate",
+            GLib.Variant("(sava{sv})",
+                         ("start-session", [GLib.Variant("a{sv}", options)], {})),
+            None, Gio.DBusCallFlags.NONE, 10000, None,
+        )
+    except GLib.Error as exc:
+        print("cc-sessions-start: %s" % exc.message, file=sys.stderr)
+        print("Is cc-sessions running (and restarted since the API was added)?",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
