@@ -69,19 +69,26 @@ def load():
     return cleaned
 
 
-def save(windows):
-    """windows: list of lists of record dicts."""
+def save(windows, write=None):
+    """windows: list of lists of record dicts.
+
+    write(path, text), when given, does the writing (the app passes its
+    background writer, so a slow disk never freezes the window). No timestamp
+    goes in: the same sessions give the same text, so an unchanged list is not
+    rewritten every few seconds.
+    """
+    payload = {"windows": [{"sessions": records} for records in windows]}
+    text = json.dumps(payload, indent=2)
+    if write is not None:
+        write(STATE_PATH, text)
+        return
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        payload = {
-            "saved_at": int(time.time()),
-            "windows": [{"sessions": records} for records in windows],
-        }
         # Write-then-rename so a crash mid-write cannot leave a truncated file
         # -- losing the session list to a botched save would defeat the point.
         temporary = STATE_PATH + ".tmp"
         with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+            handle.write(text)
         os.replace(temporary, STATE_PATH)
     except OSError:
         pass
@@ -107,5 +114,7 @@ def record_for(sess):
         # tab was originally started as.
         "mode": "claude" if session_id else sess.mode,
         "status": getattr(sess, "last_status", None),
-        "last_seen": int(time.time()),
+        # To the minute: the list is only rewritten when it changes, and a
+        # stamp to the second would change it every save.
+        "last_seen": int(time.time()) // 60 * 60,
     }

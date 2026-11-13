@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 
 # Force GTK4's software renderer BEFORE gi/Gtk is imported.
@@ -85,13 +86,76 @@ def load_config():
         return {}
 
 
+class BackgroundWriter:
+    """Writes the app's files from a thread of its own.
+
+    Saving used to happen on the thread that also draws the window, so when
+    the disk was jammed (on dev-03 a stray recursive search had the spinning
+    home disk at ~90% "full" pressure) a few-kilobyte save waited seconds in
+    the disk queue and the whole window froze: "not responding". Now the
+    window hands over the new text and carries on; this thread writes it when
+    the disk gets to it. Only the newest text per file is kept, a file whose
+    text has not changed is not written again, and every write is
+    write-then-rename so a crash never leaves half a file.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._pending = {}   # path -> newest text not yet written
+        self._written = {}   # path -> text last written
+        self._busy = False
+        threading.Thread(target=self._run, name="ccs-writer", daemon=True).start()
+
+    def write(self, path, text):
+        with self._cond:
+            if self._pending.get(path, self._written.get(path)) == text:
+                return
+            self._pending[path] = text
+            self._cond.notify_all()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                path = next(iter(self._pending))
+                text = self._pending.pop(path)
+                self._busy = True
+            ok = False
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                temporary = path + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(temporary, path)
+                ok = True
+            except OSError:
+                pass
+            with self._cond:
+                if ok:
+                    self._written[path] = text
+                self._busy = False
+                self._cond.notify_all()
+
+    def flush(self, timeout=5.0):
+        """Wait (at most timeout seconds) until everything is on disk."""
+        end = time.monotonic() + timeout
+        with self._cond:
+            while self._pending or self._busy:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+        return True
+
+
+WRITER = BackgroundWriter()
+
+
 def save_config(config):
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, indent=2)
-    except OSError:
-        pass
+    # Turned into text here, so later changes to the dict cannot leak into a
+    # write that is still waiting for the disk.
+    WRITER.write(CONFIG_PATH, json.dumps(config, indent=2))
 
 
 def short_path(path):
@@ -2398,6 +2462,11 @@ class CCSessions(Gtk.Application):
         rearm()
         GLib.timeout_add(500, rearm)
 
+    def do_shutdown(self):
+        # Give saves still waiting for the disk a moment to land.
+        WRITER.flush(5.0)
+        Gtk.Application.do_shutdown(self)
+
     def do_activate(self):
         if not self.session_windows():
             self.restore_windows()
@@ -2447,7 +2516,7 @@ class CCSessions(Gtk.Application):
             while len(windows) <= slot:
                 windows.append([])
             windows[slot].append(record)
-        state.save(windows)
+        state.save(windows, write=WRITER.write)
 
     def restore_windows(self):
         """Recreate last run's windows; their sessions become the shared pool."""
