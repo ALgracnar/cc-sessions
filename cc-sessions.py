@@ -1785,8 +1785,12 @@ class SessionWindow(Gtk.ApplicationWindow):
             return "finished"
         if obj.status == "idle" and self.app.is_parked(key):
             return "parked"
-        if obj.status in ("busy", "shell"):
+        if obj.status == "busy":
             return "busy"
+        if obj.status == "shell":
+            # Claude is running a shell command: said apart from "busy", in
+            # the same cyan its own row uses.
+            return "shell"
         return "idle"
 
     def _make_story_row(self, story, members, collapsed, here_index=None):

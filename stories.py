@@ -30,6 +30,7 @@ SUMMARY_ORDER = (
     ("blocked", "needs you", "waiting"),
     ("finished", "finished", "finished"),
     ("busy", "busy", "busy"),
+    ("shell", "shell", "shell"),
     ("parked", "waiting", "parked"),
     ("idle", "idle", "idle"),
     ("done", "done", "done"),
