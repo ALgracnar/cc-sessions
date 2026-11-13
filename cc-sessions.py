@@ -769,13 +769,13 @@ class SessionWindow(Gtk.ApplicationWindow):
         # alongside it. `waitingFor` is already readable on its own ("input
         # needed", "dialog open", "sandbox request").
         if done:
-            detail = "idle  ·  done"
+            detail = "done"        # ✓ already says idle; the long form was cut off
         elif entry.status == "waiting" or attention == "blocked":
             detail = entry.waiting_for or "input needed"
         elif attention == "finished":
             detail = "finished"
         elif parked:
-            detail = "idle  ·  waiting"
+            detail = "waiting"
         else:
             detail = entry.status_label
         sub = Gtk.Label(label=detail, xalign=0)

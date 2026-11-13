@@ -36,7 +36,7 @@ Nothing surfaces it. This does.
   a plain URL that was merely printed opens with Ctrl+click. Same split as
   GNOME Terminal.
 - **Mark a session done.** When Claude reports `idle`, a ✓ appears next to
-  the status: click it and the row reads `idle · done` in purple, and stops
+  the status: click it and the row reads `done` in purple, and stops
   announcing that it finished. For work that is over but has to stay
   visible until it ships. Click again to unmark.
 - **Multiple windows**, each owning its own sessions, sharing one recovery pool.
@@ -59,7 +59,7 @@ Nothing surfaces it. This does.
   middle of a header to put it in the story, or on the header's top edge
   (bottom edge, when folded) to put it above (below) the story as a loose row.
 - **Mark a session as waiting on it.** A ◷ sits in front of ✓: click it and
-  the row reads `idle · waiting` in periwinkle -- parked until something
+  the row reads `waiting` in periwinkle -- parked until something
   outside it happens (a deploy, a reply). Waiting and done exclude each other;
   "needs you" and "finished" still win over it.
 - **Story marks.** The story's +▾ dropdown (and right-click) has *Mark story
