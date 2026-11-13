@@ -40,6 +40,7 @@ install:
 	  > $(DESTDIR)$(BINDIR)/cc-sessions
 	chmod 755 $(DESTDIR)$(BINDIR)/cc-sessions
 	install -m 755 cc-sessions-start $(DESTDIR)$(BINDIR)/cc-sessions-start
+	install -m 755 cc-sessions-close $(DESTDIR)$(BINDIR)/cc-sessions-close
 	sed 's|@BINDIR@|$(BINDIR)|g' data/cc-sessions.desktop.in \
 	  > $(DESTDIR)$(DESKTOPDIR)/cc-sessions.desktop
 	install -m 644 data/cc-sessions.svg $(DESTDIR)$(ICONDIR)/cc-sessions.svg
@@ -50,7 +51,7 @@ install:
 
 uninstall:
 	rm -rf $(DESTDIR)$(LIBDIR)
-	rm -f $(DESTDIR)$(BINDIR)/cc-sessions $(DESTDIR)$(BINDIR)/cc-sessions-start
+	rm -f $(DESTDIR)$(BINDIR)/cc-sessions $(DESTDIR)$(BINDIR)/cc-sessions-start $(DESTDIR)$(BINDIR)/cc-sessions-close
 	rm -f $(DESTDIR)$(DESKTOPDIR)/cc-sessions.desktop
 	rm -f $(DESTDIR)$(ICONDIR)/cc-sessions.svg
 	-update-desktop-database $(DESTDIR)$(DESKTOPDIR) 2>/dev/null

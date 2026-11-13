@@ -8,6 +8,7 @@ blocked on you (`waiting`) rather than merely quiet (`idle`).
   cc-sessions --new-instance  run a separate process (see multi-window note)
 """
 
+import faulthandler
 import json
 import os
 import signal
@@ -28,13 +29,14 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Vte", "3.91")
+gi.require_version("Graphene", "1.0")
 
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Vte
+from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gtk, Vte
 
 import roster
 import state
 import stories
-from session import TerminalSession, default_session_name
+from session import TerminalSession, _parent_pid, default_session_name
 from theme import TerminalTheme
 
 APP_ID = "eu.nevron.ccsessions"
@@ -55,7 +57,11 @@ PALETTE_SLOT = {
 # Orange is a literal because the ANSI palette has none. It carries the quieter
 # of the two attention states -- finished while you were away -- leaving the
 # more insistent yellow for a session that is actually blocked.
-LITERAL_COLOUR = {"finished": FINISHED_ORANGE}
+# "Waiting on it": YOUR mark that a session (or story) is parked until
+# something outside it happens -- a deploy, a reply. Every ANSI slot already
+# means something here, so it gets its own soft periwinkle.
+PARKED_PERIWINKLE = "#9A8CFF"
+LITERAL_COLOUR = {"finished": FINISHED_ORANGE, "parked": PARKED_PERIWINKLE}
 COLOUR_NAMES = list(PALETTE_SLOT) + list(LITERAL_COLOUR)
 LIVE_STATUSES = ("waiting", "busy", "shell", "idle")
 
@@ -515,11 +521,31 @@ class SessionWindow(Gtk.ApplicationWindow):
         # an open menu would pull the row out from beneath it. So the list
         # holds still while a menu is open.
         self._menu_open = False
+        # Same for a drag: a rebuild mid-drag would throw away the row being
+        # dragged and the row lit up under the pointer. The drop's changes
+        # are drawn once the drag ends.
+        self._dragging = False
+        self._drop_lit = None        # (widget, css class, "+ add" hint) lit now
         self._story_members = {}     # story id -> member keys, as last drawn
+        self._story_items = {}       # story id -> member items, as last drawn
+        self._story_colour = {}      # story id -> its status colour name
+        self._story_first = {}       # story id -> member first in the stored
+                                     # order (where the story sits), which a
+                                     # starred member drawn on top may not be
+        self._pointer_ages = []      # (label, row key): pointer-line ages
+        self._pinned_sid = None      # story whose lid is pinned at the top
+        self._pin_dirty = True       # rebuild the pinned copy on next check
+        self._pin_queued = False     # a pin check is already waiting to run
+        self._hold_scroll = None     # scroll to restore after a rebuild's layout
+        self._hold_queued = False
         for name, handler in (
+            ("story-start", self._story_start),
             ("story-new", self._story_new),
             ("story-add", self._story_add),
             ("story-remove", self._story_remove),
+            ("story-pin", lambda key: self.app.toggle_pinned(key)),
+            ("story-done", self._story_done),
+            ("story-parked", self._story_parked),
             ("story-rename", self._story_rename),
             ("story-ungroup", self._story_ungroup),
             ("story-toggle", self._story_toggle),
@@ -619,11 +645,51 @@ class SessionWindow(Gtk.ApplicationWindow):
         self.listbox.add_css_class("ccs-list")
         self.listbox.connect("row-activated", self._on_row_activated)
 
+        # Below the last row: a drop zone that fills the empty space (and is
+        # never thinner than a row's grip area, even in a list that scrolls).
+        # Drops land ABOVE the row you are over, so without it nothing could
+        # ever be dropped at the very end of the list.
+        self.list_end = Gtk.Box()
+        self.list_end.set_vexpand(True)
+        self.list_end.add_css_class("ccs-list-end")
+        self._attach_drop(self.list_end, lambda payload: self._drop_plan_end(payload))
+
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        column.append(self.listbox)
+        column.append(self.list_end)
+
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_child(self.listbox)
-        box.append(scroller)
+        scroller.set_child(column)
+        self.scroller = scroller
+
+        # The list sits in an overlay so two things can float over it: the
+        # pinned copy of a long open story's lid (a list row cannot stick on
+        # its own), and the little tag that says what a drop will do.
+        self.overlay = Gtk.Overlay()
+        self.overlay.set_vexpand(True)
+        self.overlay.set_child(scroller)
+
+        self.pin_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.pin_slot.set_valign(Gtk.Align.START)
+        self.pin_slot.set_visible(False)
+        self.overlay.add_overlay(self.pin_slot)
+
+        self.drop_tag = Gtk.Label(xalign=0)
+        self.drop_tag.add_css_class("ccs-drop-tag")
+        self.drop_tag.set_valign(Gtk.Align.START)
+        self.drop_tag.set_halign(Gtk.Align.END)
+        self.drop_tag.set_margin_end(8)
+        self.drop_tag.set_ellipsize(3)
+        self.drop_tag.set_can_target(False)
+        self.drop_tag.set_visible(False)
+        self.overlay.add_overlay(self.drop_tag)
+
+        adj = scroller.get_vadjustment()
+        adj.connect("value-changed", lambda *_: self._queue_pin_check())
+        adj.connect("changed", lambda *_: self._queue_pin_check())
+        box.append(self.overlay)
 
         return box
 
@@ -662,6 +728,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         # Only an idle session can be marked done -- a busy or blocked one is
         # plainly not finished, so offering the mark there would be nonsense.
         done = entry.status == "idle" and self.app.is_done(key)
+        parked = entry.status == "idle" and not done and self.app.is_parked(key)
 
         colour = entry.status if entry.status in LIVE_STATUSES else "dim"
         if done:
@@ -670,6 +737,10 @@ class SessionWindow(Gtk.ApplicationWindow):
             colour = "waiting"      # orange: blocked on you
         elif attention == "finished":
             colour = "finished"     # yellow: done, but you were not looking
+        elif parked:
+            # periwinkle: you are waiting on it. Below "finished" on purpose:
+            # it finishing while you were away is the news you waited for.
+            colour = "parked"
 
         dot = Gtk.Label(label="■" if done else ("●" if attention else "■"))
         dot.add_css_class("ccs-dot")
@@ -703,6 +774,8 @@ class SessionWindow(Gtk.ApplicationWindow):
             detail = entry.waiting_for or "input needed"
         elif attention == "finished":
             detail = "finished"
+        elif parked:
+            detail = "idle  ·  waiting"
         else:
             detail = entry.status_label
         sub = Gtk.Label(label=detail, xalign=0)
@@ -715,6 +788,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         # The mark lives next to the status it qualifies, and only appears
         # when Claude says idle -- it is an annotation on that state.
         if owned is not None and entry.status == "idle":
+            line.append(self._parked_button(key, parked))
             line.append(self._done_button(key, done))
 
         age = Gtk.Label(label=entry.describe_age(), xalign=1)
@@ -752,6 +826,18 @@ class SessionWindow(Gtk.ApplicationWindow):
                 self.set_title(sess.name)
                 return
         self.set_title("Claude sessions")
+
+    def _parked_button(self, key, parked):
+        """Toggle YOUR 'waiting on it' mark: parked until something outside
+        happens. Sits in front of ✓; the two marks exclude each other."""
+        button = Gtk.Button(label="◷")
+        button.add_css_class("ccs-done-btn")
+        if parked:
+            button.add_css_class("ccs-parked-on")
+        button.set_valign(Gtk.Align.CENTER)
+        button.set_tooltip_text("Stop waiting on it" if parked else "Mark as waiting on it")
+        button.connect("clicked", lambda *_: self.app.toggle_parked(key))
+        return button
 
     def _done_button(self, key, done):
         """Toggle YOUR 'done' mark on an idle session.
@@ -1015,15 +1101,22 @@ class SessionWindow(Gtk.ApplicationWindow):
             order = self.app.manual_order()
 
         position = {k: i for i, k in enumerate(order)}
+        story_of = self.app.story_of()
 
         def sort_key(item):
-            # One exception to "nothing moves unless you move it": dormant rows
-            # always sit at the bottom. They are not part of the working set
-            # until resumed, so they should never come between live sessions --
-            # and a resumed one takes its manual place automatically, since the
-            # record and the session it becomes share an id.
-            return (1 if item[0] == "record" else 0,
-                    position.get(item_key(*item), len(order)))
+            # One exception to "nothing moves unless you move it": LOOSE
+            # dormant rows always sit at the bottom. They are not part of the
+            # working set until resumed, so they should never come between
+            # live sessions -- and a resumed one takes its manual place
+            # automatically, since the record and the session it becomes
+            # share an id.
+            # Rows in a saved story do NOT sink: a story stays where you put
+            # it even when everything in it is waiting to be resumed. Sinking
+            # those too dragged whole stories down among the dormant rows, and
+            # nothing live could then be placed below them.
+            key = item_key(*item)
+            sinks = item[0] == "record" and key not in story_of
+            return (1 if sinks else 0, position.get(key, len(order)))
 
         return sorted(items, key=sort_key)
 
@@ -1037,19 +1130,23 @@ class SessionWindow(Gtk.ApplicationWindow):
         drag its own handle removes the conflict entirely, and makes it
         discoverable rather than a hidden gesture.
         """
-        box = row.get_child()
-        top = box.get_first_child() if box is not None else None
-        line = top.get_next_sibling() if top is not None else None
+        line = self._status_line(row)
         if line is not None:
-            grip = Gtk.Label(label="⠿")
-            grip.add_css_class("ccs-grip")
-            grip.set_tooltip_text("Drag to reorder")
-            grip.set_valign(Gtk.Align.CENTER)
+            if getattr(row, "pinned", False):
+                grip = self._star_label(draggable=True)
+            else:
+                grip = Gtk.Label(label="⠿")
+                grip.add_css_class("ccs-grip")
+                grip.set_tooltip_text("Drag to reorder")
+                grip.set_valign(Gtk.Align.CENTER)
             source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
             source.connect(
                 "prepare",
                 lambda _s, _x, _y, key=row.item_key: Gdk.ContentProvider.new_for_value(key),
             )
+            self._watch_drag(source, row.item_key,
+                             lambda row=row: getattr(row, "item_name", "") or "",
+                             lambda row=row: [row.get_child()])
             grip.add_controller(source)
 
             # The status line is already a box (status … age ×), so the grip
@@ -1058,21 +1155,356 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         # Drops are still accepted anywhere on the row -- only the *start* of a
         # drag needs to be deliberate.
-        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        self._attach_drop(row, lambda payload, row=row: self._drop_plan(payload, row=row))
 
-        def dropped(_t, value, _x, _y, key=row.item_key):
-            if not isinstance(value, str) or not value or value == key:
+    @staticmethod
+    def _status_line(row):
+        """The row's second line (status … age ×), where the grip sits."""
+        box = getattr(row, "body", None) or row.get_child()
+        top = box.get_first_child() if box is not None else None
+        return top.get_next_sibling() if top is not None else None
+
+    @staticmethod
+    def _star_label(draggable=False):
+        """★ in the grip's seat: this session is pinned to the top of its
+        story. Right-click the row to unpin."""
+        star = Gtk.Label(label="★")
+        star.add_css_class("ccs-grip")
+        star.add_css_class("ccs-star")
+        star.set_valign(Gtk.Align.CENTER)
+        star.set_tooltip_text(
+            "Pinned to the top of its story%s.\nRight-click the row to unpin."
+            % (" — drag to reorder pinned ones" if draggable else ""))
+        return star
+
+    # -- drag and drop -----------------------------------------------------
+    #
+    # Two payloads travel: a session's row key, or STORY_DRAG + a story id
+    # (from a lid's grip). Every drop handler goes through _drop_plan, which
+    # checks for a story payload FIRST -- otherwise "story\t…" would be filed
+    # into a story as if it were a row key.
+
+    STORY_DRAG = "story\t"
+
+    def _watch_drag(self, source, payload, label, ghosts):
+        """Fade what is being dragged, hold the list still, show its name."""
+        def begin(_source, drag):
+            self._dragging = True
+            self.app.drag_payload = payload
+            for widget in ghosts():
+                if widget is not None:
+                    widget.add_css_class("ccs-dragging")
+            # Without an icon GTK draws the payload itself ("story\ts17…").
+            icon = Gtk.Label(label=label())
+            icon.add_css_class("ccs-drop-tag")
+            Gtk.DragIcon.get_for_drag(drag).set_child(icon)
+
+        def end(_source, _drag, _delete):
+            self.app.drag_payload = None
+            for widget in ghosts():
+                if widget is not None:
+                    widget.remove_css_class("ccs-dragging")
+            self._clear_drop()
+            self._dragging = False
+            self._last_signature = None
+
+            def after():
+                self.refresh()
                 return False
-            # Where you drop it is where it lives: among a story's rows it
-            # joins that story, among loose rows it leaves its story.
-            self.app.follow_story(value, key, self._story_members)
-            self.app.move_in_order(value, key,
-                                   [r.item_key for r in self._rows
-                                    if getattr(r, "item_key", None)])
+            GLib.idle_add(after)
+
+        source.connect("drag-begin", begin)
+        source.connect("drag-end", end)
+
+    def _attach_drop(self, widget, plan_for, banded=False):
+        """Accept drops on widget; plan_for(payload) says what they would do.
+
+        banded: plan_for also gets where the pointer is on the widget --
+        "top", "middle" or "bottom" -- so a story lid can tell "put it in
+        here" (middle) from "put it above / below this story" (its edges).
+        """
+        def band_of(y):
+            height = widget.get_height()
+            if height <= 0:
+                return "middle"
+            edge = max(10, min(18, height * 0.3))
+            if y < edge:
+                return "top"
+            if y > height - edge:
+                return "bottom"
+            return "middle"
+
+        def plan_at(payload, y):
+            return plan_for(payload, band_of(y)) if banded else plan_for(payload)
+        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        target.set_preload(True)
+
+        def payload_of(t):
+            if self.app.drag_payload is not None:
+                return self.app.drag_payload
+            value = t.get_value()
+            if isinstance(value, GObject.Value):
+                value = value.get_value()
+            return value
+
+        def hover(t, _x, y):
+            plan = plan_at(payload_of(t), y)
+            if plan is None:
+                self._clear_drop()
+                return Gdk.DragAction(0)
+            self._light_drop(plan)
+            return Gdk.DragAction.MOVE
+
+        def dropped(_t, value, _x, y):
+            self._clear_drop()
+            plan = plan_at(value, y)
+            if plan is None:
+                return False
+            plan[2]()
             return True
 
+        target.connect("enter", hover)
+        target.connect("motion", hover)
+        target.connect("leave", lambda *_: self._clear_drop())
         target.connect("drop", dropped)
-        row.add_controller(target)
+        widget.add_controller(target)
+
+    def _drop_plan_beside(self, key, sid, lid_box, band):
+        """Dropping a session on the top/bottom edge of story sid's lid:
+        it leaves any saved story and lands just above / below sid."""
+        members = list(self._story_members.get(sid, ()))
+        if not members:
+            return None
+        src_sid = self._story_of_key(key)
+        if src_sid is not None and stories.is_virtual(src_sid):
+            # Grouped by its name: moving it cannot take it out of that family.
+            if src_sid == sid:
+                return None
+        seeds = [r.item_key for r in self._rows if getattr(r, "item_key", None)]
+        collapsed = self.app.story_collapsed(sid)
+        name = self._key_name(key)
+        story_name = self._story_name(sid)
+
+        if band == "bottom" and collapsed:
+            # Before whatever is drawn right after this story, or at the end.
+            after = self._first_key_after_story(sid)
+            if after == key:
+                after = self._first_key_after_story(sid, skip=key)
+
+            def move():
+                self.app.follow_story(key, None, self._story_members)
+                if after is None:
+                    self.app.move_block_to_end([key], seeds)
+                else:
+                    self.app.move_in_order(key, after, seeds)
+            return ((lid_box, "ccs-drop-after", False),
+                    "%s goes below %s" % (name, story_name), move)
+        if band == "bottom":
+            return None          # under an open lid: its first member is there
+
+        first = self._story_first.get(sid, members[0])
+
+        def move():
+            self.app.follow_story(key, None, self._story_members)
+            if key != first:
+                self.app.move_in_order(key, first, seeds)
+        return ((lid_box, "ccs-drop-before", False),
+                "%s goes above %s" % (name, story_name), move)
+
+    def _first_key_after_story(self, sid, skip=None):
+        """Key of the first row drawn after story sid's block (a following
+        story counts by its first member), or None at the end of the list."""
+        rows = self._rows
+        start = next((i for i, r in enumerate(rows)
+                      if getattr(r, "story", None) is not None
+                      and r.story["id"] == sid), None)
+        if start is None:
+            return None
+        for row in rows[start + 1:]:
+            if getattr(row, "story_id", None) == sid:
+                continue
+            story = getattr(row, "story", None)
+            key = (self._story_first.get(story["id"])
+                   if story is not None else getattr(row, "item_key", None))
+            if key is not None and key != skip:
+                return key
+        return None
+
+    def _drop_plan(self, payload, row=None, lid_sid=None, lid_box=None, band="middle"):
+        """What dropping payload on a session row (row) or a lid (lid_sid,
+        lid_box) would do: ((widget to light, css class, show "+ add"), tag
+        text or None, action), or None when nothing would happen.
+
+        band is where on a lid the pointer is (see _attach_drop)."""
+        if not isinstance(payload, str) or not payload:
+            return None
+        seeds = [r.item_key for r in self._rows if getattr(r, "item_key", None)]
+
+        if payload.startswith(self.STORY_DRAG):
+            sid = payload[len(self.STORY_DRAG):]
+            keys = list(self._story_members.get(sid, ()))
+            if not keys:
+                return None
+            if lid_sid is not None:
+                # Over another story's lid: the block lands above that story.
+                if lid_sid == sid:
+                    return None
+                over_sid, line_on = lid_sid, lid_box
+            else:
+                if row is None or row.item_key in keys:
+                    return None          # over itself: nothing
+                over_sid = getattr(row, "story_id", None)
+                line_on = row.body if over_sid is None else self._lid_of(over_sid)
+            if over_sid is not None:
+                # Stories never nest, split or merge: over any part of another
+                # story, the block goes above that story's lid.
+                dst = self._story_first.get(over_sid)
+            else:
+                dst = row.item_key
+            if dst is None or line_on is None:
+                return None
+            tag = "%s · %d move here" % (self._story_name(sid), len(keys))
+            return ((line_on, "ccs-drop-before", False), tag,
+                    lambda: self.app.move_block_in_order(keys, dst, seeds))
+
+        key = payload
+        if lid_sid is not None and band in ("top", "bottom"):
+            # On a lid's edge: the session goes above (or, under a folded
+            # story, below) the story, as a loose row -- the only way to put
+            # one BETWEEN stories when stories sit next to each other.
+            plan = self._drop_plan_beside(key, lid_sid, lid_box, band)
+            if plan is not None:
+                return plan
+        if lid_sid is not None:
+            # A session onto a lid joins that story, as its last member.
+            members = list(self._story_members.get(lid_sid, ()))
+
+            def join():
+                self.app.add_to_story(key, lid_sid, members)
+                others = [k for k in members if k != key]
+                if others and not self.app.auto_sort():
+                    self.app.move_after_in_order(key, others[-1], seeds)
+            return ((lid_box, "ccs-lid-drop", True), None, join)
+
+        if row is None or key == row.item_key:
+            return None
+        if (getattr(row, "record", None) is not None
+                and getattr(row, "story_id", None) is None
+                and not self._is_record_key(key)):
+            # Loose dormant rows always sink below everything live, so a live
+            # session dropped among them lands above the first of them. Say
+            # so with the line, instead of drawing it where it cannot go.
+            first = next((r for r in self._rows
+                          if getattr(r, "record", None) is not None
+                          and getattr(r, "story_id", None) is None), row)
+            src_sid = self._story_of_key(key)
+            tag = ("%s leaves %s" % (self._key_name(key), self._story_name(src_sid))
+                   if src_sid is not None and not stories.is_virtual(src_sid)
+                   else None)
+
+            def to_end():
+                # A loose dormant row's stored position means nothing (it
+                # sinks either way), so "just above them" is simply after
+                # everything that does not sink: the end of the order.
+                self.app.follow_story(key, None, self._story_members)
+                self.app.move_block_to_end([key], seeds)
+            return ((first.body, "ccs-drop-before", False), tag, to_end)
+        src_sid = self._story_of_key(key)
+        dst_sid = getattr(row, "story_id", None)
+        if dst_sid is not None and dst_sid != src_sid:
+            tag = "%s joins %s" % (self._key_name(key), self._story_name(dst_sid))
+        elif dst_sid is None and src_sid is not None:
+            tag = "%s leaves %s" % (self._key_name(key), self._story_name(src_sid))
+        else:
+            tag = None
+        dst_key = row.item_key
+
+        def move():
+            # Where you drop it is where it lives: among a story's rows it
+            # joins that story, among loose rows it leaves its story.
+            self.app.follow_story(key, dst_key, self._story_members)
+            self.app.move_in_order(key, dst_key, seeds)
+        return ((row.body, "ccs-drop-before", False), tag, move)
+
+    def _drop_plan_end(self, payload):
+        """What dropping payload in the zone below the last row would do:
+        it goes to the very end of the list, outside any story."""
+        if not isinstance(payload, str) or not payload:
+            return None
+        seeds = [r.item_key for r in self._rows if getattr(r, "item_key", None)]
+        last = seeds[-1] if seeds else None
+
+        if payload.startswith(self.STORY_DRAG):
+            sid = payload[len(self.STORY_DRAG):]
+            keys = list(self._story_members.get(sid, ()))
+            if not keys or last in keys:
+                return None          # already the last thing in the list
+            tag = "%s · %d move here" % (self._story_name(sid), len(keys))
+            return ((self.list_end, "ccs-drop-before", False), tag,
+                    lambda: self.app.move_block_to_end(keys, seeds))
+
+        key = payload
+        src_sid = self._story_of_key(key)
+        if key == last and src_sid is None:
+            return None              # already last and loose: nothing to do
+        # A by-name story cannot be left by moving (the name still matches),
+        # so only a saved story gets the "leaves" tag.
+        tag = ("%s leaves %s" % (self._key_name(key), self._story_name(src_sid))
+               if src_sid is not None and not stories.is_virtual(src_sid)
+               else None)
+
+        def move():
+            self.app.follow_story(key, None, self._story_members)
+            self.app.move_block_to_end([key], seeds)
+        return ((self.list_end, "ccs-drop-before", False), tag, move)
+
+    def _light_drop(self, plan):
+        (widget, css, hint), tag, _act = plan
+        lit = self._drop_lit
+        if (lit is not None and lit[0] is widget and lit[1] == css
+                and (tag or "") == (self.drop_tag.get_label()
+                                    if self.drop_tag.get_visible() else "")):
+            return
+        self._clear_drop()
+        widget.add_css_class(css)
+        hint_label = getattr(widget, "drop_hint", None) if hint else None
+        if hint_label is not None:
+            hint_label.set_visible(True)
+        self._drop_lit = (widget, css, hint_label)
+        if tag:
+            # The tag sits on the line: the target's top edge, right end.
+            ok, point = widget.compute_point(self.overlay, Graphene.Point().init(0, 0))
+            y = point.y if ok else 0
+            self.drop_tag.set_label(tag)
+            self.drop_tag.set_margin_top(max(0, int(y) - 8))
+            self.drop_tag.set_visible(True)
+
+    def _clear_drop(self):
+        lit, self._drop_lit = self._drop_lit, None
+        if lit is not None:
+            widget, css, hint_label = lit
+            widget.remove_css_class(css)
+            if hint_label is not None:
+                hint_label.set_visible(False)
+        self.drop_tag.set_visible(False)
+
+    def _is_record_key(self, key):
+        row = next((r for r in self._rows if getattr(r, "item_key", None) == key), None)
+        return getattr(row, "record", None) is not None
+
+    def _story_of_key(self, key):
+        """The story a row key is drawn in (by-name stories too), or None."""
+        return next((sid for sid, keys in self._story_members.items()
+                     if key in keys), None)
+
+    def _key_name(self, key):
+        row = next((r for r in self._rows if getattr(r, "item_key", None) == key), None)
+        return getattr(row, "item_name", None) or "session"
+
+    def _lid_of(self, sid):
+        header = next((r for r in self._rows if getattr(r, "story", None) is not None
+                       and r.story["id"] == sid), None)
+        return getattr(header, "lid", None)
 
     def update_ages(self, entries):
         """Retick the age labels without touching the rows themselves.
@@ -1091,9 +1523,16 @@ class SessionWindow(Gtk.ApplicationWindow):
             text = fresh.get(getattr(row, "item_key", None))
             if label is not None and text is not None and label.get_label() != text:
                 label.set_label(text)
+        # The pointer line on a folded lid ("↑ AL-9 · busy · 19m") ticks too.
+        for label, key in self._pointer_ages:
+            text = fresh.get(key)
+            if text is not None:
+                text = ("  ·  " + text) if text else ""
+                if label.get_label() != text:
+                    label.set_label(text)
 
     def refresh(self, entries=None):
-        if self._menu_open:
+        if self._menu_open or self._dragging:
             return
         if entries is None:
             entries = roster.read()
@@ -1116,9 +1555,10 @@ class SessionWindow(Gtk.ApplicationWindow):
         # you start something, which reads as a failure.
         # Exited sessions stay listed (as "ended") rather than vanishing, so
         # the last output is still readable and you can close them deliberately.
+        matched = {id(self.app.session_for_entry(e)) for e in entries}
         local_only = [
             sess for sess in self.app.sessions
-            if self.owns(sess) and not any(sess.matches(e) for e in entries)
+            if self.owns(sess) and id(sess) not in matched
         ]
 
         # One list, ordered once -- rather than three groups each with their
@@ -1148,12 +1588,36 @@ class SessionWindow(Gtk.ApplicationWindow):
 
         selected = self.stack.get_visible_child()
 
+        # Where the list is scrolled to. A rebuild must not move it: putting
+        # the focus back on a freshly built row (below) made GTK scroll to a
+        # row it had not placed yet, which threw the list to the top -- so
+        # folding a story jumped you away from where you were.
+        adj = self.scroller.get_vadjustment()
+        keep_scroll = adj.get_value()
+
+        # If a row has the keyboard focus, note WHICH one and let go of it
+        # before the rows are thrown away. Removing the focused row made GTK
+        # hand focus -- and with it the selection -- to whatever row it found
+        # next, so folding a story looked like being moved to another session.
+        focus = self.get_focus()
+        focus_row = (focus if isinstance(focus, Gtk.ListBoxRow)
+                     else focus.get_ancestor(Gtk.ListBoxRow) if focus is not None
+                     else None)
+        focus_id = None
+        if focus_row is not None and focus_row.get_parent() is self.listbox:
+            story = getattr(focus_row, "story", None)
+            focus_id = ("story", story["id"]) if story is not None else (
+                "item", getattr(focus_row, "item_key", None))
+            self.set_focus(None)
+
         while True:
             row = self.listbox.get_row_at_index(0)
             if row is None:
                 break
             self.listbox.remove(row)
         self._rows = []
+        self._pointer_ages = []
+        self._drop_lit = None
 
         manual = not self.app.auto_sort()
         blocks = stories.group(
@@ -1165,12 +1629,28 @@ class SessionWindow(Gtk.ApplicationWindow):
             use_prefix=self.app.story_by_prefix(),
             ignored_prefixes=self.app.ignored_prefixes(),
         )
+        # Where each story sits is decided by its first member in the stored
+        # order -- note that before starred members are lifted to the top.
+        self._story_first = {
+            block[1]["id"]: item_key(*block[2][0])
+            for block in blocks if block[0] == "story" and block[2]
+        }
+        pinned = self.app.pinned_keys()
+        for block in blocks:
+            if block[0] == "story":
+                # Starred (pinned) members first, in their own order; the
+                # rest keep theirs. Sorting is stable, so nothing else moves.
+                block[2].sort(key=lambda i: 0 if item_key(*i) in pinned else 1)
         self._story_members = {
             block[1]["id"]: [item_key(*i) for i in block[2]]
             for block in blocks if block[0] == "story"
         }
+        self._story_items = {
+            block[1]["id"]: list(block[2])
+            for block in blocks if block[0] == "story"
+        }
 
-        def add_item(item, child=False):
+        def add_item(item, story_id=None, index=0, count=0):
             kind, obj, owned = item
             if kind == "entry":
                 row = self._make_row(obj, owned, self.app.attention_kind(obj))
@@ -1179,16 +1659,49 @@ class SessionWindow(Gtk.ApplicationWindow):
             else:
                 row = self._make_local_row(obj)
             row.item_key = item_key(kind, obj, owned)
-            row.story_id = None
-            if child:
-                row.get_child().add_css_class("ccs-row-child")
+            row.item_name = self._item_name(item)
+            row.story_id = story_id
+            row.pinned = story_id is not None and row.item_key in pinned
+            # The row's own box: drop highlighting and the grip find it here,
+            # whether or not it is wrapped in a tray piece below.
+            row.body = row.get_child()
             if manual:
                 self._attach_reorder(row)
+            elif row.pinned:
+                # No dragging in the automatic order, but the star still says
+                # "this one stays on top".
+                line = self._status_line(row)
+                if line is not None:
+                    line.prepend(self._star_label())
+            if story_id is not None:
+                # A member sits in its story's tray: the existing row box,
+                # unchanged inside, wrapped in one piece of the tray.
+                body = row.body
+                row.set_child(None)
+                tray = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                tray.add_css_class("ccs-tray")
+                if index == 0:
+                    tray.add_css_class("ccs-tray-first")
+                if index == count - 1:
+                    tray.add_css_class("ccs-tray-last")
+                body.add_css_class("ccs-tray-member")
+                # The stripe down the tray's left carries the story's status
+                # colour, the same as its lid's.
+                tray.add_css_class("ccs-st-%s" % self._story_colour.get(story_id, "dim"))
+                tray.append(body)
+                row.set_child(tray)
+                row.add_css_class("ccs-tray-row")
+            else:
+                # A session in no story: no stripe, a hairline under it, and a
+                # bar (not a box) when selected -- never mistaken for a story.
+                row.body.add_css_class("ccs-loose")
+                row.add_css_class("ccs-loose-row")
             self._attach_menu(row, lambda key=row.item_key: self._session_menu(key))
             self.listbox.append(row)
             self._rows.append(row)
             if owned is not None and owned.terminal is selected:
                 self.listbox.select_row(row)
+            return row
 
         for block in blocks:
             if block[0] == "item":
@@ -1196,12 +1709,56 @@ class SessionWindow(Gtk.ApplicationWindow):
                 continue
             _, story, members = block
             collapsed = self.app.story_collapsed(story["id"])
-            header = self._make_story_row(story, members, collapsed)
+            # Which member is on screen, if any: a folded lid boxes its square
+            # and names it on the pointer line.
+            here = next((i for i, (_k, _o, owned) in enumerate(members)
+                         if selected is not None and owned is not None
+                         and owned.terminal is selected), None)
+            header = self._make_story_row(story, members, collapsed,
+                                          here if collapsed else None)
             self.listbox.append(header)
             self._rows.append(header)
+            header.last_member_row = None
             if not collapsed:
-                for item in members:
-                    add_item(item, child=True)
+                for index, item in enumerate(members):
+                    header.last_member_row = add_item(
+                        item, story["id"], index, len(members))
+            elif here is not None:
+                # The session on screen is folded away inside this story:
+                # the story itself stands selected, "you are in here".
+                self.listbox.select_row(header)
+
+        if focus_id is not None:
+            # Give the focus back to the same row, rebuilt. If that row is
+            # gone (its story folded), the session on screen takes it, so
+            # typing keeps going where you were.
+            target = next((r for r in self._rows if (
+                ("story", r.story["id"]) if getattr(r, "story", None) is not None
+                else ("item", getattr(r, "item_key", None))) == focus_id), None)
+            if target is not None:
+                target.grab_focus()
+            elif selected is not None:
+                selected.grab_focus()
+
+        # Put the scroll back now, and once more after the new rows are laid
+        # out (a shorter list may only then have room for it). Low priority
+        # runs after GTK's layout pass.
+        adj.set_value(keep_scroll)
+        self._hold_scroll = keep_scroll
+        if not self._hold_queued:
+            self._hold_queued = True
+
+            def hold():
+                self._hold_queued = False
+                if self._hold_scroll is not None:
+                    adj.set_value(self._hold_scroll)
+                    self._hold_scroll = None
+                return False
+            GLib.idle_add(hold, priority=GLib.PRIORITY_LOW)
+
+        # Row positions exist only after layout: check the pinned lid then.
+        self._pin_dirty = True
+        self._queue_pin_check()
 
     # -- stories -----------------------------------------------------------
 
@@ -1229,28 +1786,86 @@ class SessionWindow(Gtk.ApplicationWindow):
             return "blocked"
         if attention == "finished":
             return "finished"
+        if obj.status == "idle" and self.app.is_parked(key):
+            return "parked"
         if obj.status in ("busy", "shell"):
             return "busy"
         return "idle"
 
-    def _make_story_row(self, story, members, collapsed):
-        """The header of a story: arrow, name, count, and a one-line sum.
+    def _make_story_row(self, story, members, collapsed, here_index=None):
+        """A story's header row: its lid (see _build_lid).
 
-        Collapsed or not, the sum and its colour cover every member -- so a
-        session waiting on you inside a folded story still lights the header.
+        Collapsed or not, the squares and the sum cover every member -- so a
+        session waiting on you inside a folded story still lights the lid.
         """
         row = Gtk.ListBoxRow()
         row.entry = None
         row.session = None
         row.story = story
         row.item_key = None
+        row.add_css_class("ccs-story-row")
 
+        lid = self._build_lid(story, members, collapsed, here_index)
+        row.lid = lid
+        row.set_child(lid)
+
+        kind = ("grouped by name" if story.get("virtual") else "story")
+        row.set_tooltip_text("%s  (%s)\nClick to %s.  Right-click for more." % (
+            story["name"], kind, "expand" if collapsed else "collapse"))
+
+        # The lid's own grip moves the whole story (manual order only). The
+        # row itself never gets a drag source: that swallowed clicks.
+        if not self.app.auto_sort():
+            self._attach_story_grip(lid, story["id"])
+
+        # Drop a session on the lid to put it in this story, as its last
+        # member; drop a whole story on it to move that story above this one.
+        # Its top edge (and bottom edge, when folded) puts the session beside
+        # the story instead.
+        self._attach_drop(row, lambda payload, band, sid=story["id"], lid=lid:
+                          self._drop_plan(payload, lid_sid=sid, lid_box=lid,
+                                          band=band),
+                          banded=True)
+
+        self._attach_menu(row, lambda sid=story["id"]: self._story_menu(sid))
+        return row
+
+    def _build_lid(self, story, members, collapsed, here_index=None, pinned=False):
+        """The raised box at the top of a story, also used for the pinned copy.
+
+        Top line: grip slot, arrow, name, "+ add" (only while a session is
+        dragged over it), member count, +▾. Second line: one square per
+        member in its state colour, then the summary. Third line, only when
+        the session on screen is folded away in here: "↑ name · state · age".
+        """
+        sid = story["id"]
         states = [self._member_state(item) for item in members]
         colour, summary = stories.summarize(states)
+        attention = "blocked" in states
+        # YOUR mark that the story is finished, like ✓ on a session. Something
+        # inside waiting on you still wins: a done story must never hide that.
+        done = self.app.story_done(sid) and not attention
+        parked = self.app.story_parked(sid) and not attention and not done
+        if done:
+            colour, summary = "done", "done  ·  " + summary
+        elif parked:
+            colour, summary = "parked", "waiting  ·  " + summary
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        box.add_css_class("ccs-row")
-        box.add_css_class("ccs-story")
+        lid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        lid.add_css_class("ccs-lid")
+        if not collapsed:
+            lid.add_css_class("ccs-lid-open")
+        if attention:
+            lid.add_css_class("ccs-lid-attn")
+        if done:
+            lid.add_css_class("ccs-lid-done")
+        # The stripe on the left says how the story stands: its summary's
+        # colour (needs you, finished, busy, idle, done...).
+        lid.add_css_class("ccs-st-%s" % colour)
+        if not pinned:
+            self._story_colour[sid] = colour
+        if pinned:
+            lid.add_css_class("ccs-lid-pinned")
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         arrow = Gtk.Label(label="▸" if collapsed else "▾")
@@ -1261,48 +1876,144 @@ class SessionWindow(Gtk.ApplicationWindow):
         name.set_hexpand(True)
         name.set_ellipsize(3)
         name.add_css_class("ccs-story-name")
-        if "blocked" in states:
+        if attention:
             name.add_css_class("ccs-attention")
         top.append(name)
+
+        hint = Gtk.Label(label="+ add")
+        hint.add_css_class("ccs-drop-hint")
+        hint.set_visible(False)
+        top.append(hint)
+        lid.drop_hint = hint
 
         count = Gtk.Label(label=str(len(members)), xalign=1)
         count.add_css_class("ccs-age")
         top.append(count)
-        box.append(top)
+
+        top.append(self._story_add_button(sid))
+        lid.append(top)
+        lid.top_line = top
 
         line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        dot = Gtk.Label(label="●" if colour in ("waiting", "finished") else "■")
-        dot.add_css_class("ccs-dot")
-        dot.add_css_class("ccs-dot-%s" % colour)
-        line.append(dot)
+        line.add_css_class("ccs-lid-line")
+        squares = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        squares.add_css_class("ccs-squares")
+        squares.set_valign(Gtk.Align.CENTER)
+        shown = states[:self.MAX_SQUARES]
+        for index, state in enumerate(shown):
+            square = Gtk.Label(label="●" if state in ("blocked", "finished") else "■")
+            square.add_css_class("ccs-sq")
+            square.add_css_class("ccs-dot-%s" % stories.state_colour(state))
+            if index == here_index:
+                square.add_css_class("ccs-sq-here")
+            squares.append(square)
+        if len(states) > len(shown):
+            more = Gtk.Label(label="+%d" % (len(states) - len(shown)))
+            more.add_css_class("ccs-sq-more")
+            if here_index is not None and here_index >= len(shown):
+                more.add_css_class("ccs-sq-here")
+            squares.append(more)
+        line.append(squares)
+
         sub = Gtk.Label(label=summary, xalign=0)
         sub.set_hexpand(True)
         sub.set_ellipsize(3)
         sub.add_css_class("ccs-sub")
         sub.add_css_class("ccs-sub-%s" % colour)
         line.append(sub)
-        box.append(line)
+        lid.append(line)
 
-        kind = ("grouped by name" if story.get("virtual") else "story")
-        row.set_tooltip_text("%s  (%s)\nClick to %s.  Right-click for more." % (
-            story["name"], kind, "expand" if collapsed else "collapse"))
+        if here_index is not None and here_index < len(members):
+            item = members[here_index]
+            pointer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            pointer.add_css_class("ccs-pointer")
+            text = Gtk.Label(xalign=0)
+            text.set_markup("↑ <b>%s</b>  ·  %s" % (
+                GLib.markup_escape_text(self._item_name(item)),
+                GLib.markup_escape_text(stories.state_word(states[here_index]))))
+            text.set_ellipsize(3)
+            pointer.append(text)
+            kind, obj, owned = item
+            age_text = obj.describe_age() if kind == "entry" else ""
+            age = Gtk.Label(label=("  ·  " + age_text) if age_text else "", xalign=0)
+            pointer.append(age)
+            if kind == "entry":
+                self._pointer_ages.append((age, item_key(kind, obj, owned)))
+            lid.append(pointer)
+        return lid
 
-        row.set_child(box)
+    MAX_SQUARES = 12
 
-        # Drop a session on the header to put it in this story.
-        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+    def _story_add_button(self, sid):
+        """+▾ on the lid: start a Claude session or a terminal in this story.
 
-        def dropped(_t, value, _x, _y, sid=story["id"]):
-            if not isinstance(value, str) or not value:
-                return False
-            self.app.add_to_story(value, sid, self._story_members.get(sid, ()))
-            return True
+        A button inside a row claims its own click, like ✓ and ×, so pressing
+        it never folds the story.
+        """
+        button = Gtk.MenuButton()
+        button.add_css_class("ccs-story-add")
+        button.set_valign(Gtk.Align.CENTER)
+        button.set_tooltip_text("Start something in this story")
+        label = Gtk.Label(label="+▾")
+        button.set_child(label)
+        model = Gio.Menu()
+        model.append_section(None, self._story_start_menu(sid))
+        model.append_section(None, self._story_done_menu(sid))
+        button.set_menu_model(model)
+        popover = button.get_popover()
+        if popover is not None:
+            # Same rule as the right-click menus: the list holds still while
+            # the dropdown is open, or a rebuild would destroy it.
+            def shown(_pop):
+                self._menu_open = True
 
-        target.connect("drop", dropped)
-        row.add_controller(target)
+            def closed(_pop):
+                def after():
+                    self._menu_open = False
+                    # The keyboard goes back to the session on screen, not to
+                    # the button, so typing carries on where it was.
+                    current = self.stack.get_visible_child()
+                    if current is not None:
+                        current.grab_focus()
+                    self._last_signature = None
+                    self.refresh()
+                    return False
+                GLib.idle_add(after)
+            popover.connect("show", shown)
+            popover.connect("closed", closed)
+        return button
 
-        self._attach_menu(row, lambda sid=story["id"]: self._story_menu(sid))
-        return row
+    def _story_start_menu(self, sid):
+        name = self._story_name(sid)
+        section = Gio.Menu()
+        section.append_item(self._menu_item("New Claude session in %s" % name,
+                                            "story-start", "%s\tclaude" % sid))
+        section.append_item(self._menu_item("New terminal in %s" % name,
+                                            "story-start", "%s\tshell" % sid))
+        return section
+
+    def _attach_story_grip(self, lid, sid, ghosts=None):
+        """Put the grip in front of the lid's top line; it drags the story."""
+        grip = Gtk.Label(label="⠿")
+        grip.add_css_class("ccs-grip")
+        grip.set_tooltip_text("Drag to move the whole story")
+        grip.set_valign(Gtk.Align.CENTER)
+        source = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        source.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(
+            self.STORY_DRAG + sid))
+
+        def faded():
+            widgets = [self._lid_of(sid)]
+            widgets += [r.get_child() for r in self._rows
+                        if getattr(r, "story_id", None) == sid]
+            return widgets + (ghosts() if ghosts else [])
+
+        self._watch_drag(source, self.STORY_DRAG + sid,
+                         lambda: "%s  ·  %d" % (self._story_name(sid),
+                                                len(self._story_members.get(sid, ()))),
+                         faded)
+        grip.add_controller(source)
+        lid.top_line.prepend(grip)
 
     def _attach_menu(self, row, build):
         """Right-click on a row opens the menu `build()` returns."""
@@ -1364,18 +2075,86 @@ class SessionWindow(Gtk.ApplicationWindow):
             rest.append_item(self._menu_item(
                 "Take out of “%s”" % story_names[current], "story-remove", key))
         menu.append_section(None, rest)
+
+        if self._story_of_key(key) is not None:
+            pin = Gio.Menu()
+            pin.append_item(self._menu_item(
+                "Unpin from top of story" if key in self.app.pinned_keys()
+                else "Pin to top of story", "story-pin", key))
+            menu.append_section(None, pin)
         return menu
+
+    def _story_done_menu(self, sid):
+        section = Gio.Menu()
+        section.append_item(self._menu_item(
+            "◷  Stop waiting on story" if self.app.story_parked(sid)
+            else "◷  Mark story as waiting", "story-parked", sid))
+        section.append_item(self._menu_item(
+            "✓  Unmark story done" if self.app.story_done(sid) else "✓  Mark story done",
+            "story-done", sid))
+        return section
+
+    def _story_done(self, sid):
+        self.app.toggle_story_done(sid, self._story_members.get(sid, ()))
+
+    def _story_parked(self, sid):
+        self.app.toggle_story_parked(sid, self._story_members.get(sid, ()))
 
     def _story_menu(self, sid):
         menu = Gio.Menu()
+        # The +▾ items on top, as their own sections.
+        menu.append_section(None, self._story_start_menu(sid))
+        menu.append_section(None, self._story_done_menu(sid))
+        rest = Gio.Menu()
         collapsed = self.app.story_collapsed(sid)
-        menu.append_item(self._menu_item("Expand" if collapsed else "Collapse",
+        rest.append_item(self._menu_item("Expand" if collapsed else "Collapse",
                                          "story-toggle", sid))
-        menu.append_item(self._menu_item("Rename…", "story-rename", sid))
-        menu.append_item(self._menu_item(
+        rest.append_item(self._menu_item("Rename…", "story-rename", sid))
+        rest.append_item(self._menu_item(
             "Stop grouping by this name" if stories.is_virtual(sid) else "Ungroup",
             "story-ungroup", sid))
+        menu.append_section(None, rest)
         return menu
+
+    def _story_folder(self, sid):
+        """Where a session started from a story's +▾ opens: the folder of the
+        story's first member (the one its row shows), else the default."""
+        items = self._story_items.get(sid) or []
+        folder = None
+        if items:
+            kind, obj, owned = items[0]
+            if kind == "record":
+                folder = obj.get("cwd")
+            elif owned is not None:
+                folder = owned.current_cwd()
+            else:
+                folder = getattr(obj, "cwd", None)
+        if folder and os.path.isdir(folder):
+            return folder
+        return self.app.default_folder()
+
+    def _story_start(self, payload):
+        """+▾ → start a session or terminal as the story's last member.
+
+        The order matters (see _on_start_session_action): seat the terminal
+        first, THEN touch the story, because changing a story refreshes the
+        list and a refresh adopts any unseated terminal.
+        """
+        sid, _, mode = payload.partition("\t")
+        if mode not in ("claude", "shell") or sid not in self._story_members:
+            return
+        members = list(self._story_members.get(sid, ()))
+        folder = self._story_folder(sid)
+        sess = self.app.start_session(
+            name=self.app.unique_name(default_session_name(folder)),
+            cwd=folder, mode=mode)
+        self.show_session(sess)
+        sid = self.app.add_to_story("local:" + sess.key, sid, members)
+        if self.app.story_collapsed(sid):
+            self.app.toggle_story(sid)
+        self._last_signature = None
+        self.refresh()
+        sess.terminal.grab_focus()
 
     def _story_name(self, sid):
         if stories.is_virtual(sid):
@@ -1407,12 +2186,122 @@ class SessionWindow(Gtk.ApplicationWindow):
 
     def _story_toggle(self, sid):
         self.app.toggle_story(sid)
+        current = self.stack.get_visible_child()
+        if current is not None:
+            current.grab_focus()
+
+    # -- pinned lid ----------------------------------------------------------
+
+    def _queue_pin_check(self):
+        """Check the pinned lid once things settle. The scroll signals also
+        fire in the middle of a layout pass, which is no time to build
+        widgets; an idle after layout also folds a burst into one check."""
+        if not self._pin_queued:
+            self._pin_queued = True
+            GLib.idle_add(self._update_pinned_idle, priority=GLib.PRIORITY_LOW)
+
+    def _update_pinned_idle(self):
+        self._pin_queued = False
+        self._update_pinned()
+        return False
+
+    def _update_pinned(self):
+        """Pin a copy of the lid of the open story you are scrolled into.
+
+        A list row cannot stick on its own (GTK CSS has no sticky), so this
+        watches the scroll position: once an open story's lid is above the
+        top of the list while its tray is still on screen, a full, working
+        copy of the lid sits under the toolbar. When the tray's last row
+        reaches it, it simply goes away. One story at a time; folded stories
+        never pin, they have nothing below them.
+        """
+        if self._menu_open or self._dragging:
+            return
+        top = self.scroller.get_vadjustment().get_value()
+        chosen = None
+        for header in self._rows:
+            last = getattr(header, "last_member_row", None)
+            if getattr(header, "story", None) is None or last is None:
+                continue
+            ok, lid = header.compute_bounds(self.listbox)
+            ok2, end = last.compute_bounds(self.listbox)
+            if not (ok and ok2):
+                continue
+            if (lid.get_y() < top
+                    and end.get_y() + end.get_height() - top > lid.get_height()):
+                chosen = header
+                break
+        sid = chosen.story["id"] if chosen is not None else None
+        if sid is None:
+            if self.pin_slot.get_visible():
+                self.pin_slot.set_visible(False)
+            self._pinned_sid = None
+            return
+        if sid != self._pinned_sid or self._pin_dirty or not self.pin_slot.get_visible():
+            self._fill_pin_slot(chosen)
+        self._pinned_sid = sid
+        self._pin_dirty = False
+
+    def _fill_pin_slot(self, header):
+        child = self.pin_slot.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.pin_slot.remove(child)
+            child = nxt
+        story = header.story
+        sid = story["id"]
+        members = self._story_items.get(sid, [])
+        pinned = self._build_lid(story, members, False, None, pinned=True)
+        if not self.app.auto_sort():
+            self._attach_story_grip(pinned, sid, ghosts=lambda: [pinned])
+        pinned.set_tooltip_text(header.get_tooltip_text())
+
+        # Clicking it does what clicking the lid does: fold, keep the session
+        # on screen and the keyboard in its terminal. Then bring the folded
+        # lid to the top, or you'd be left looking at whatever followed it.
+        # "released", so a drag from the grip (which claims the press) never
+        # folds anything; +▾ claims its own click.
+        click = Gtk.GestureClick(button=1)
+        click.connect("released", lambda *_: self._pinned_fold(sid))
+        pinned.add_controller(click)
+        self._attach_menu(pinned, lambda: self._story_menu(sid))
+        self._attach_drop(pinned, lambda payload: self._drop_plan(
+            payload, lid_sid=sid, lid_box=pinned))
+        self.pin_slot.append(pinned)
+        self.pin_slot.set_visible(True)
+
+    def _pinned_fold(self, sid):
+        header = next((r for r in self._rows if getattr(r, "story", None) is not None
+                       and r.story["id"] == sid), None)
+        lid_y = None
+        if header is not None:
+            ok, bounds = header.compute_bounds(self.listbox)
+            if ok:
+                lid_y = bounds.get_y()
+        self.pin_slot.set_visible(False)
+        self._pinned_sid = None
+        self._story_toggle(sid)
+        if lid_y is not None:
+            adj = self.scroller.get_vadjustment()
+            adj.set_value(lid_y)
+
+            def again():
+                # After the list has been laid out again.
+                adj.set_value(lid_y)
+                return False
+            GLib.idle_add(again, priority=GLib.PRIORITY_LOW)
 
     # -- actions -----------------------------------------------------------
 
     def _on_row_activated(self, listbox, row):
         if getattr(row, "story", None) is not None:
+            # Folding is not navigating: the session on screen stays, and the
+            # keyboard goes back to it (the list rebuild has just re-selected
+            # its row, or the folded story's header).
             self.app.toggle_story(row.story["id"])
+            current = self.stack.get_visible_child()
+            if current is not None:
+                current.grab_focus()
             return
         if getattr(row, "record", None) is not None:
             self.resume_restorable(row.record)
@@ -1517,6 +2406,8 @@ class CCSessions(Gtk.Application):
         # that became idle/waiting while you were elsewhere is flagged until
         # you actually visit it.
         self.attention = {}       # key -> bool
+        self.drag_payload = None  # what is being dragged right now, if anything
+        self._owner_cache = {}    # (pid, proc start) -> (terminal pid, when)
         self._prev_status = {}    # key -> last seen status
         self.config = load_config()
 
@@ -1525,6 +2416,7 @@ class CCSessions(Gtk.Application):
     def do_startup(self):
         Gtk.Application.do_startup(self)
         self._apply_css()
+        self._start_freeze_log()
 
         for name, callback, accels in (
             ("new-window", lambda *_: self.new_window(), ["<Control><Shift>n"]),
@@ -1564,7 +2456,49 @@ class CCSessions(Gtk.Application):
         action.connect("activate", self._on_start_session_action)
         self.add_action(action)
 
+        # The other half of the API: close a session from outside, exactly as
+        # its × button would (the tab ends and is NOT offered back on restart;
+        # its transcript stays on disk, so `claude -r` can still resume it).
+        # Parameter is a dict:
+        #   name       -- session name, as shown in the sidebar
+        #   session_id -- Claude session id (wins over name when both given)
+        #   force      -- also close a session that is busy or waiting on you
+        #                 default: False, so a script cannot kill work in flight
+        # Only sessions this app started can be closed. Use the
+        # cc-sessions-close helper rather than raw gdbus.
+        action = Gio.SimpleAction.new("close-session", GLib.VariantType.new("a{sv}"))
+        action.connect("activate", self._on_close_session_action)
+        self.add_action(action)
+
         GLib.timeout_add(1000, self._tick)
+
+    FREEZE_LOG = os.path.expanduser("~/.cache/cc-sessions/freeze.log")
+    FREEZE_SECONDS = 4
+
+    def _start_freeze_log(self):
+        """Write down what the app was doing whenever it hangs.
+
+        A timer re-arms faulthandler every half second; if the main loop is
+        stuck for FREEZE_SECONDS (long enough for "not responding"), the
+        timer cannot re-arm it, and faulthandler -- from its own thread --
+        appends every thread's Python stack to FREEZE_LOG. Costs nothing
+        while the app is healthy.
+        """
+        try:
+            os.makedirs(os.path.dirname(self.FREEZE_LOG), exist_ok=True)
+            self._freeze_file = open(self.FREEZE_LOG, "a", encoding="utf-8")
+            self._freeze_file.write("\n== started pid %d at %s ==\n" % (
+                os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S")))
+            self._freeze_file.flush()
+        except OSError:
+            return
+
+        def rearm():
+            faulthandler.dump_traceback_later(
+                self.FREEZE_SECONDS, repeat=False, file=self._freeze_file)
+            return True
+        rearm()
+        GLib.timeout_add(500, rearm)
 
     def do_activate(self):
         if not self.session_windows():
@@ -1665,6 +2599,38 @@ class CCSessions(Gtk.Application):
         window._last_signature = None
         window.refresh()
 
+    def _on_close_session_action(self, _action, parameter):
+        options = parameter.unpack() if parameter is not None else {}
+        session_id = options.get("session_id") or ""
+        name = options.get("name") or ""
+        if not session_id and not name:
+            print("[cc-sessions] close-session: give a name or a session_id",
+                  file=sys.stderr)
+            return
+        live = [s for s in self.sessions if not s.exited]
+        if session_id:
+            matches = [s for s in live if s.session_id == session_id]
+        else:
+            matches = [s for s in live if s.name == name]
+        if not matches:
+            print("[cc-sessions] close-session: no open session %r"
+                  % (session_id or name), file=sys.stderr)
+            return
+        if len(matches) > 1:
+            # Names are unique per folder only; closing the wrong twin is worse
+            # than closing nothing.
+            print("[cc-sessions] close-session: %d sessions are called %r -- "
+                  "pass session_id" % (len(matches), name), file=sys.stderr)
+            return
+        sess = matches[0]
+        if (sess.mode == "claude"
+                and getattr(sess, "last_status", None) in ("busy", "waiting", "shell")
+                and not options.get("force")):
+            print("[cc-sessions] close-session: %r is %s -- not closed (force to override)"
+                  % (sess.name, sess.last_status), file=sys.stderr)
+            return
+        self.close_session(sess)
+
     def _new_session_here(self):
         window = self.get_active_window()
         if window is not None:
@@ -1735,10 +2701,32 @@ class CCSessions(Gtk.Application):
     def is_done(self, key):
         return key in self.done_keys()
 
+    def parked_keys(self):
+        """Sessions YOU marked as waiting on something outside them."""
+        keys = self.config.get("parked")
+        return set(keys) if isinstance(keys, list) else set()
+
+    def is_parked(self, key):
+        return key in self.parked_keys()
+
+    def toggle_parked(self, key):
+        keys = self.parked_keys()
+        keys.discard(key) if key in keys else keys.add(key)
+        self.config["parked"] = sorted(keys)
+        if key in keys:
+            self.config["done"] = sorted(self.done_keys() - {key})
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
     def toggle_done(self, key):
         keys = self.done_keys()
         keys.discard(key) if key in keys else keys.add(key)
         self.config["done"] = sorted(keys)
+        if key in keys:
+            # Done and "waiting on it" exclude each other.
+            self.config["parked"] = sorted(self.parked_keys() - {key})
         save_config(self.config)
         for window in self.session_windows():
             window._last_signature = None
@@ -1780,6 +2768,15 @@ class CCSessions(Gtk.Application):
             story_of[new_key] = story_of.pop(old_key)
             self.config["story_of"] = story_of
             changed = True
+        parked = self.parked_keys()
+        if old_key in parked and new_key not in parked:
+            self.config["parked"] = sorted((parked - {old_key}) | {new_key})
+            changed = True
+        pinned = self.pinned_keys()
+        if old_key in pinned and new_key not in pinned:
+            pinned[pinned.index(old_key)] = new_key
+            self.config["story_pinned"] = pinned
+            changed = True
         if changed:
             save_config(self.config)
 
@@ -1796,6 +2793,58 @@ class CCSessions(Gtk.Application):
             return
         order.remove(src_key)
         order.insert(order.index(dst_key), src_key)
+        self.config["manual_order"] = order
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
+    def move_block_in_order(self, keys, dst_key, seed_keys=()):
+        """Move a whole story: its rows, in their order, to just above dst_key.
+
+        Only reorders. A by-name story is not saved by being moved -- its
+        members still share their name, so they still group.
+        """
+        order = self.manual_order()
+        for key in seed_keys:
+            if key not in order:
+                order.append(key)
+        moved = stories.move_block(order, set(keys), dst_key)
+        if moved is None:
+            return
+        self.config["manual_order"] = moved
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
+    def move_block_to_end(self, keys, seed_keys=()):
+        """Move rows (in their order) to the bottom of the stored order."""
+        order = self.manual_order()
+        for key in seed_keys:
+            if key not in order:
+                order.append(key)
+        wanted = set(keys)
+        if not wanted & set(order):
+            return
+        block = [k for k in order if k in wanted]
+        order = [k for k in order if k not in wanted] + block
+        self.config["manual_order"] = order
+        save_config(self.config)
+        for window in self.session_windows():
+            window._last_signature = None
+            window.refresh()
+
+    def move_after_in_order(self, src_key, after_key, seed_keys=()):
+        """Put src_key just below after_key, and remember it."""
+        order = self.manual_order()
+        for key in seed_keys:
+            if key not in order:
+                order.append(key)
+        if src_key not in order or after_key not in order or src_key == after_key:
+            return
+        order.remove(src_key)
+        order.insert(order.index(after_key) + 1, src_key)
         self.config["manual_order"] = order
         save_config(self.config)
         for window in self.session_windows():
@@ -1840,9 +2889,57 @@ class CCSessions(Gtk.Application):
         raw = self.config.get("story_prefix_off")
         return [p for p in raw if isinstance(p, str)] if isinstance(raw, list) else []
 
+    def pinned_keys(self):
+        """Rows pinned (starred) to the top of whatever story they are in."""
+        raw = self.config.get("story_pinned")
+        return [k for k in raw if isinstance(k, str)] if isinstance(raw, list) else []
+
+    def _story_marks(self, name):
+        raw = self.config.get(name)
+        return [s for s in raw if isinstance(s, str)] if isinstance(raw, list) else []
+
+    def story_done(self, sid):
+        return sid in self._story_marks("story_done")
+
+    def story_parked(self, sid):
+        return sid in self._story_marks("story_parked")
+
+    def _toggle_story_mark(self, name, other, sid, member_keys):
+        """Flip one story mark; done and waiting exclude each other."""
+        if stories.is_virtual(sid):
+            # A by-name story has nothing saved to hang the mark on: save it.
+            sid = self.materialize(sid, member_keys)
+        marks = self._story_marks(name)
+        if sid in marks:
+            marks.remove(sid)
+        else:
+            marks.append(sid)
+            self.config[other] = [s for s in self._story_marks(other) if s != sid]
+        self.config[name] = marks
+        self._stories_changed()
+
+    def toggle_story_done(self, sid, member_keys=()):
+        self._toggle_story_mark("story_done", "story_parked", sid, member_keys)
+
+    def toggle_story_parked(self, sid, member_keys=()):
+        self._toggle_story_mark("story_parked", "story_done", sid, member_keys)
+
+    def toggle_pinned(self, key):
+        if not key:
+            return
+        pinned = self.pinned_keys()
+        if key in pinned:
+            pinned.remove(key)
+        else:
+            pinned.append(key)
+        self.config["story_pinned"] = pinned
+        self._stories_changed()
+
     def stories_signature(self):
         """Everything about stories that changes what the list looks like."""
-        return json.dumps([self.stories(), self.story_of(),
+        return json.dumps([self.stories(), self.story_of(), self.pinned_keys(),
+                           self.config.get("story_done"),
+                           self.config.get("story_parked"),
                            self.config.get("story_collapsed"),
                            self.story_by_prefix(), self.ignored_prefixes()],
                           sort_keys=True)
@@ -1866,6 +2963,11 @@ class CCSessions(Gtk.Application):
                 k: v for k, v in collapsed.items()
                 if v and (k in ids or stories.is_virtual(k))
             }
+        ids = {s["id"] for s in kept}
+        for mark in ("story_done", "story_parked"):
+            marks = self.config.get(mark)
+            if isinstance(marks, list):
+                self.config[mark] = [k for k in marks if k in ids]
 
     def create_story(self, name, keys):
         sid = "s%d" % int(time.time() * 1000)
@@ -1908,9 +3010,12 @@ class CCSessions(Gtk.Application):
         self._stories_changed()
 
     def add_to_story(self, key, sid, member_keys=()):
+        """Put key in story sid. Returns the story id actually used: a by-name
+        story gets a new id when it is saved by this."""
         if stories.is_virtual(sid):
             sid = self.materialize(sid, member_keys)
         self.assign_story(key, sid)
+        return sid
 
     def follow_story(self, src_key, dst_key, members_by_story):
         """A row dragged onto another takes on that row's saved story."""
@@ -1963,6 +3068,11 @@ class CCSessions(Gtk.Application):
         self._stories_changed()
 
     def forget_key(self, key):
+        pinned = self.pinned_keys()
+        if key in pinned:
+            pinned.remove(key)
+            self.config["story_pinned"] = pinned
+            save_config(self.config)
         story_of = self.story_of()
         if key in story_of:
             story_of.pop(key)
@@ -2056,11 +3166,48 @@ class CCSessions(Gtk.Application):
         self.persist()
         return sess
 
+    OWNER_TTL = 10.0     # seconds a "which terminal runs this pid" answer is kept
+
     def session_for_entry(self, entry):
-        for sess in self.sessions:
-            if sess.matches(entry):
-                return sess
-        return None
+        """The terminal a roster entry runs in, or None.
+
+        Same answer as asking every session's matches(), but much cheaper.
+        That asked each session in turn, and every miss climbed the entry's
+        whole process tree in /proc -- 25 entries x 23 terminals came to
+        ~1,250 file reads per pass, and the app makes several passes a second
+        (tick, attention, list rebuild). That kept the main thread busy and
+        made scrolling and folding stutter, worse on a loaded machine. Now an
+        entry's own pid is checked first, then its parent chain is walked
+        ONCE, and the answer is kept for a few seconds (a running process does
+        not change parents).
+        """
+        pid = entry.pid
+        if not isinstance(pid, int):
+            return None
+        by_pid = {s.pid: s for s in self.sessions if s.pid is not None}
+        sess = by_pid.get(pid)
+        if sess is not None:
+            return sess
+        cache_key = (pid, entry.proc_start)
+        now = time.monotonic()
+        cached = self._owner_cache.get(cache_key)
+        if cached is not None and now - cached[1] < self.OWNER_TTL:
+            owner = cached[0]
+        else:
+            owner = None
+            current = pid
+            for _ in range(12):            # same depth limit as _has_ancestor
+                current = _parent_pid(current)
+                if current is None or current <= 1:
+                    break
+                if current in by_pid:
+                    owner = current
+                    break
+            if len(self._owner_cache) > 500:
+                self._owner_cache = {k: v for k, v in self._owner_cache.items()
+                                     if now - v[1] < self.OWNER_TTL}
+            self._owner_cache[cache_key] = (owner, now)
+        return by_pid.get(owner) if owner is not None else None
 
     # -- "needs you" tracking ---------------------------------------------
 
@@ -2211,7 +3358,7 @@ class CCSessions(Gtk.Application):
     def clear_attention_for(self, sess):
         """Clear the flag the moment a session is opened, not a tick later."""
         for entry in roster.read():
-            if sess.matches(entry):
+            if self.session_for_entry(entry) is sess:
                 self.attention[self.entry_key(entry)] = None
                 break
 
@@ -2279,7 +3426,6 @@ class CCSessions(Gtk.Application):
             .ccs-list > row {{
                 background: transparent; padding: 0; border: 0;
             }}
-            .ccs-list > row:selected {{ background: alpha({sel}, 0.18); }}
             .ccs-row {{ padding: 7px 12px; }}
             .ccs-dot {{ font-size: {s_dot}; }}
             .ccs-name {{ color: {fg}; font-family: {font}; font-size: {s_name}; }}
@@ -2293,6 +3439,7 @@ class CCSessions(Gtk.Application):
                 opacity: 0.5; padding: 0 2px;
             }}
             .ccs-grip:hover {{ opacity: 1; }}
+            .ccs-grip.ccs-star {{ color: {fg}; opacity: 0.95; }}
             .ccs-done-btn {{
                 background: transparent; border: 0; box-shadow: none;
                 color: {dim}; font-family: {font}; padding: 0 4px;
@@ -2300,26 +3447,141 @@ class CCSessions(Gtk.Application):
             }}
             .ccs-done-btn:hover {{ opacity: 1; background: transparent; }}
             .ccs-done-on {{ color: {done}; opacity: 1; }}
+            .ccs-parked-on {{ color: {parked}; opacity: 1; }}
             .ccs-close {{
                 background: transparent; border: 0; box-shadow: none;
                 color: {dim}; font-family: {font}; padding: 0 4px;
                 min-width: 0; min-height: 0; opacity: 0.55;
             }}
             .ccs-close:hover {{ color: {attn}; opacity: 1; background: transparent; }}
-            .ccs-story {{ padding-left: 8px; }}
             .ccs-story-arrow {{
-                color: {dim}; font-family: {font}; font-size: {s_name};
+                color: {fg}; font-family: {font}; font-size: {s_name};
                 min-width: 1em;
             }}
             .ccs-story-name {{
-                color: {fg}; font-family: {font}; font-size: {s_name};
+                color: {fg}; font-family: {font}; font-size: {s_lid};
                 font-weight: bold;
             }}
-            /* Members hang off their story: indented, with a faint rail on
-               the left that ties them to the header above. */
-            .ccs-row.ccs-row-child {{
-                margin-left: 14px; padding-left: 12px;
-                border-left: 2px solid alpha({dim}, 0.35);
+            /* Rows that hold a lid or a tray piece paint nothing themselves. */
+            .ccs-list > row.ccs-story-row,
+            .ccs-list > row.ccs-story-row:selected,
+            .ccs-list > row.ccs-tray-row:selected {{ background: transparent; }}
+
+            /* The lid: a story's raised header box. */
+            .ccs-lid {{
+                margin: 4px 5px; padding: 8px 8px 7px 6px;
+                background: mix({bg}, {fg}, 0.10);
+                border: 1px solid alpha({fg}, 0.17);
+                border-top-color: alpha({fg}, 0.30);
+                border-left: 4px solid {dim};
+                border-radius: 6px;
+            }}
+            .ccs-lid-open {{
+                margin-bottom: 0; border-radius: 6px 6px 0 0;
+                border-bottom-color: alpha({fg}, 0.10);
+            }}
+            .ccs-lid-attn {{
+                background: mix({bg}, {attn}, 0.12);
+                border-color: alpha({attn}, 0.45);
+            }}
+            .ccs-lid-attn .ccs-story-arrow,
+            .ccs-story-name.ccs-attention {{ color: {attn}; }}
+            .ccs-list > row.ccs-story-row:selected > .ccs-lid,
+            .ccs-lid-drop {{
+                background: mix({bg}, {sel}, 0.22); border-color: {sel};
+            }}
+            .ccs-lid-pinned {{
+                margin: 0 5px; border-radius: 0; border-top-width: 0;
+                border-bottom: 2px solid shade({bg}, 0.5);
+            }}
+            .ccs-lid .ccs-grip {{ color: {fg}; opacity: 0.85; }}
+            .ccs-lid-line {{ margin-left: 3px; }}
+
+            /* +▾ on the lid (a MenuButton draws an inner button node). */
+            .ccs-story-add > button {{
+                background: transparent; box-shadow: none;
+                min-width: 22px; min-height: 18px; padding: 0 3px;
+                border: 1px solid alpha({fg}, 0.25); border-radius: 4px;
+                color: {fg}; opacity: 0.85;
+                font-family: {font}; font-size: {s_add};
+            }}
+            .ccs-story-add > button:hover {{
+                background: alpha({sel}, 0.18); opacity: 1;
+            }}
+            .ccs-story-add > button:checked {{
+                background: alpha({sel}, 0.45); border-color: {sel}; opacity: 1;
+            }}
+
+            /* One square per member (they also get .ccs-dot-<colour>), and
+               the pointer line naming the session folded away in here. */
+            .ccs-sq {{ font-family: {font}; font-size: {s_sq}; }}
+            .ccs-sq-here {{
+                outline: 1px solid {fg}; outline-offset: 1px; border-radius: 1px;
+            }}
+            .ccs-sq-more {{
+                color: {dim}; font-family: {font}; font-size: {s_tag};
+                margin-left: 2px;
+            }}
+            .ccs-pointer {{
+                color: {fg}; font-family: {font}; font-size: {s_ptr};
+                margin-left: 10px;
+            }}
+
+            /* The tray: a story's members, in a darker box under its lid. */
+            /* The tray: a story's members, continuing its lid as one card,
+               with the same status stripe down the left. */
+            .ccs-tray {{
+                margin: 0 5px; padding-left: 0;
+                background: mix({bg}, {fg}, 0.055);
+                border-left: 4px solid {dim};
+                border-right: 1px solid alpha({fg}, 0.17);
+            }}
+            .ccs-tray-last {{
+                margin-bottom: 10px; padding-bottom: 4px;
+                border-bottom: 1px solid alpha({fg}, 0.17);
+                border-radius: 0 0 6px 6px;
+            }}
+            .ccs-row.ccs-tray-member {{
+                padding: 6px 10px 6px 18px;
+                border-top: 1px solid alpha({fg}, 0.07);
+            }}
+            /* A loose session: flat, a hairline under it, a bar when chosen. */
+            /* The hairline belongs to the row's outer box and is drawn
+               shorter than the row, so it never sticks out past a rounded
+               highlight; the highlight sits 2px clear of it above and below. */
+            .ccs-row.ccs-loose {{ margin: 2px 5px; }}
+            .ccs-list > row.ccs-loose-row {{
+                background-image: linear-gradient(alpha({fg}, 0.12), alpha({fg}, 0.12));
+                background-size: calc(100% - 34px) 1px;
+                background-position: center bottom;
+                background-repeat: no-repeat;
+            }}
+            .ccs-list > row:selected {{ background-color: transparent; }}
+            .ccs-list > row:selected > .ccs-loose {{
+                background: alpha({sel}, 0.18);
+                border-radius: 6px;   /* the same corners as a story card */
+            }}
+            .ccs-tray-first > .ccs-tray-member {{ border-top-width: 0; }}
+            .ccs-list > row.ccs-tray-row:selected .ccs-tray-member {{
+                background: alpha({sel}, 0.18);
+            }}
+
+            /* Drag and drop. */
+            .ccs-drop-before {{ box-shadow: inset 0 2px 0 0 {sel}; }}
+            .ccs-drop-after {{ box-shadow: inset 0 -2px 0 0 {sel}; }}
+            .ccs-list-end {{ min-height: 28px; background: transparent; }}
+            .ccs-drop-hint {{ color: {sel}; font-family: {font}; font-size: {s_ptr}; }}
+            .ccs-drop-tag {{
+                color: {sel}; background: {bg}; border: 1px solid {sel};
+                border-radius: 3px; padding: 0 4px;
+                font-family: {font}; font-size: {s_tag};
+            }}
+            .ccs-dragging {{ opacity: 0.28; }}
+            /* GTK's own drop-target frame would draw a box around the whole
+               row; the line, the lit lid and the tag say it instead. */
+            .ccs-list > row:drop(active),
+            .ccs-lid:drop(active):not(.ccs-drop-before):not(.ccs-drop-after) {{
+                box-shadow: none; outline-width: 0;
             }}
             """.format(
                 bg=theme.bg_css,
@@ -2329,9 +3591,12 @@ class CCSessions(Gtk.Application):
                 sel=colour_for(theme, "busy"),
                 attn=colour_for(theme, "waiting"),
                 done=colour_for(theme, "done"),
+                parked=colour_for(theme, "parked"),
                 font=theme.font_family_css,
                 s_header=rem(0.75), s_dot=rem(0.62),
                 s_name=rem(0.92), s_meta=rem(0.78),
+                s_lid=rem(0.98), s_sq=rem(0.56), s_ptr=rem(0.70),
+                s_tag=rem(0.66), s_add=rem(0.82),
                 divider_edge=("border-left" if self.sidebar_side() == "right"
                               else "border-right"),
                 divider_pad=("padding-left" if self.sidebar_side() == "right"
@@ -2342,6 +3607,11 @@ class CCSessions(Gtk.Application):
             value = colour_for(theme, name)
             parts.append(".ccs-dot-%s { color: %s; }" % (name, value))
             parts.append(".ccs-sub-%s { color: %s; }" % (name, value))
+            # The status stripe wins over the selected look, so a folded story
+            # holding the session on screen still says how it stands.
+            parts.append(".ccs-lid.ccs-st-%s, .ccs-tray.ccs-st-%s, "
+                         ".ccs-list > row.ccs-story-row:selected > .ccs-lid.ccs-st-%s "
+                         "{ border-left-color: %s; }" % (name, name, name, value))
 
         # Reuse one provider and just reload its content. Adding a new provider
         # on every zoom step would stack them on the display forever.

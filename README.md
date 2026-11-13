@@ -53,6 +53,20 @@ Nothing surfaces it. This does.
   story…*, *Take out of…*, right-click a header to rename or ungroup, or (in
   the static order) drag a session onto a header or among a story's rows.
   Closing a session takes it out of its story; an emptied story disappears.
+  A story is one card with a stripe down its left in its status colour
+  (yellow needs you, orange finished, blue busy, green idle, purple done,
+  periwinkle waiting); loose sessions have no stripe. Drop a session on the
+  middle of a header to put it in the story, or on the header's top edge
+  (bottom edge, when folded) to put it above (below) the story as a loose row.
+- **Mark a session as waiting on it.** A ◷ sits in front of ✓: click it and
+  the row reads `idle · waiting` in periwinkle -- parked until something
+  outside it happens (a deploy, a reply). Waiting and done exclude each other;
+  "needs you" and "finished" still win over it.
+- **Story marks.** The story's +▾ dropdown (and right-click) has *Mark story
+  as waiting* and *Mark story done*, which colour its stripe and summary.
+- **Pin to the top of a story.** Right-click a session in a story, *Pin to top
+  of story*: it stays first however many sessions join later, and its drag
+  grip becomes ★. Several can be pinned; drag the ★ to order them.
 
 ## Install
 
@@ -79,6 +93,19 @@ sudo apt install ../cc-sessions_1.0.0_all.deb
 Remove with `make uninstall` — your settings in `~/.config/cc-sessions` are
 left alone.
 
+### Update
+
+```bash
+git pull
+make install
+```
+
+Then quit and reopen cc-sessions. Quitting closes every session; they come
+back as "resumes chat" rows you can reopen with one click.
+
+If the app ever hangs ("not responding"), what it was doing is written to
+`~/.cache/cc-sessions/freeze.log`.
+
 ## Use
 
 Run `cc-sessions`, or find **Claude Sessions** in your applications.
@@ -94,6 +121,18 @@ The toolbar buttons are settings, new terminal, and new Claude session. Both
 start immediately in your configured default folder; the dialog is for when you
 want to choose.
 
+Scripts (and Claude sessions) can do the same from outside:
+
+```sh
+cc-sessions-start --name my-task --cwd ~/project --prompt "read note.md"
+cc-sessions-close --name my-task            # same as its × button
+cc-sessions-close --name my-task --force    # even if busy or waiting on you
+```
+
+`cc-sessions-close` leaves a busy or waiting session alone unless `--force`,
+and only closes sessions the app started. The transcript stays, so
+`claude -r <id>` can still resume the conversation.
+
 ## Settings
 
 Stored in `~/.config/cc-sessions/config.json`:
@@ -106,6 +145,10 @@ Stored in `~/.config/cc-sessions/config.json`:
 | `auto_sort` | `true` (default) rearranges the list as state changes; `false` keeps it static and drag-orderable |
 | `manual_order` | the order you dragged rows into, used when `auto_sort` is off |
 | `done` | session ids you marked done |
+| `parked` | session ids you marked as waiting on it |
+| `stories`, `story_of`, `story_collapsed` | your stories, who is in which, which are folded |
+| `story_done`, `story_parked` | stories you marked done / waiting |
+| `story_pinned` | sessions pinned to the top of their story |
 | `terminal_zoom` | terminal text scale |
 | `sidebar_zoom` | session list text scale |
 

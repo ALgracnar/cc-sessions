@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Close a session in the running cc-sessions app -- same as clicking its ×.
+
+  cc-sessions-close --name my-task
+  cc-sessions-close --session-id 8376b739-...
+  cc-sessions-close --name my-task --force
+
+The tab ends and is not offered back on restart. Its Claude transcript stays
+on disk, so `claude -r <id>` can still bring the conversation back.
+
+A session that is busy or waiting on you is left alone unless --force. Only
+sessions the app started can be closed. The call is fire-and-forget: the app
+logs a refusal to its own stderr, so check the sidebar (or state.json) to
+confirm.
+"""
+
+import argparse
+import sys
+
+import gi
+from gi.repository import Gio, GLib
+
+APP_ID = "eu.nevron.ccsessions"
+OBJECT_PATH = "/eu/nevron/ccsessions"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    which = parser.add_mutually_exclusive_group(required=True)
+    which.add_argument("--name", help="session name, as shown in the sidebar")
+    which.add_argument("--session-id", help="Claude session id")
+    parser.add_argument("--force", action="store_true",
+                        help="also close a session that is busy or waiting on you")
+    args = parser.parse_args()
+
+    options = {}
+    if args.name:
+        options["name"] = GLib.Variant("s", args.name)
+    if args.session_id:
+        options["session_id"] = GLib.Variant("s", args.session_id)
+    if args.force:
+        options["force"] = GLib.Variant("b", True)
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    try:
+        bus.call_sync(
+            APP_ID, OBJECT_PATH, "org.gtk.Actions", "Activate",
+            GLib.Variant("(sava{sv})",
+                         ("close-session", [GLib.Variant("a{sv}", options)], {})),
+            None, Gio.DBusCallFlags.NONE, 10000, None,
+        )
+    except GLib.Error as exc:
+        print("cc-sessions-close: %s" % exc.message, file=sys.stderr)
+        print("Is cc-sessions running (and restarted since close-session was added)?",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

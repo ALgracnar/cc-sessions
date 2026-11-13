@@ -30,6 +30,7 @@ SUMMARY_ORDER = (
     ("blocked", "needs you", "waiting"),
     ("finished", "finished", "finished"),
     ("busy", "busy", "busy"),
+    ("parked", "waiting", "parked"),
     ("idle", "idle", "idle"),
     ("done", "done", "done"),
     ("terminal", "terminal", "shell"),
@@ -120,6 +121,30 @@ def summarize(states):
              for state, label, _colour in SUMMARY_ORDER if counts[state]]
     colour = next((c for state, _label, c in SUMMARY_ORDER if counts[state]), "dim")
     return colour, "  ·  ".join(parts) or "empty"
+
+
+def state_colour(state):
+    """The palette colour name for one member state (its square on the lid)."""
+    return next((c for s, _label, c in SUMMARY_ORDER if s == state), "dim")
+
+
+def state_word(state):
+    """The summary's word for one member state ("busy", "needs you", ...)."""
+    return next((label for s, label, _c in SUMMARY_ORDER if s == state), state)
+
+
+def move_block(order, keys, dst_key):
+    """`order` with `keys` taken out (their order kept) and put before dst_key.
+
+    Returns a new list, or None when the move makes no sense: dst_key is one
+    of the moved keys, or is not in the order at all.
+    """
+    if dst_key in keys or dst_key not in order:
+        return None
+    block = [k for k in order if k in keys]
+    rest = [k for k in order if k not in keys]
+    at = rest.index(dst_key)
+    return rest[:at] + block + rest[at:]
 
 
 def is_virtual(story_id):
