@@ -1887,7 +1887,8 @@ class SessionWindow(Gtk.ApplicationWindow):
         lid.drop_hint = hint
 
         count = Gtk.Label(label=str(len(members)), xalign=1)
-        count.add_css_class("ccs-age")
+        count.add_css_class("ccs-story-count")
+        count.set_valign(Gtk.Align.CENTER)
         top.append(count)
 
         top.append(self._story_add_button(sid))
@@ -3457,6 +3458,12 @@ class CCSessions(Gtk.Application):
             .ccs-story-arrow {{
                 color: {fg}; font-family: {font}; font-size: {s_name};
                 min-width: 1em;
+            }}
+            /* How many sessions the story holds: readable at a glance, a step
+               quieter than the name. */
+            .ccs-story-count {{
+                color: {fg}; opacity: 0.8; font-family: {font};
+                font-size: {s_name}; font-weight: bold; margin-right: 2px;
             }}
             .ccs-story-name {{
                 color: {fg}; font-family: {font}; font-size: {s_lid};
