@@ -1003,6 +1003,17 @@ class SessionWindow(Gtk.ApplicationWindow):
             name=self.app.unique_name(record.get("name") or default_session_name(cwd)),
             cwd=cwd, mode=mode, resume_id=resume_id,
         )
+        # Keep the row where it was -- in its story, at its place -- from the
+        # first moment. Until Claude registered, the new terminal was known
+        # only as "local:…", which no story or saved order knew, so a resumed
+        # story member dropped out to the bottom for a few seconds.
+        if resume_id:
+            # Resuming keeps the conversation's id: claim it right away.
+            sess.session_id = resume_id
+        else:
+            # Starting fresh: the new terminal takes over the old row's place,
+            # story, pin and marks.
+            self.app.rename_key(item_key("record", record), "local:" + sess.key)
         self.show_session(sess)
         self.app.drop_pending(record)
 
