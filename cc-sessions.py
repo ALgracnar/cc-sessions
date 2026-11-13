@@ -533,9 +533,6 @@ class SessionWindow(Gtk.ApplicationWindow):
                                      # order (where the story sits), which a
                                      # starred member drawn on top may not be
         self._pointer_ages = []      # (label, row key): pointer-line ages
-        self._pinned_sid = None      # story whose lid is pinned at the top
-        self._pin_dirty = True       # rebuild the pinned copy on next check
-        self._pin_queued = False     # a pin check is already waiting to run
         self._hold_scroll = None     # scroll to restore after a rebuild's layout
         self._hold_queued = False
         for name, handler in (
@@ -664,17 +661,13 @@ class SessionWindow(Gtk.ApplicationWindow):
         scroller.set_child(column)
         self.scroller = scroller
 
-        # The list sits in an overlay so two things can float over it: the
-        # pinned copy of a long open story's lid (a list row cannot stick on
-        # its own), and the little tag that says what a drop will do.
+        # The list sits in an overlay so the little tag that says what a drop
+        # will do can float over it. (A pinned copy of the lid of the story
+        # you were scrolled into used to float here too; it was removed: it
+        # drew oddly and did work on every scroll step.)
         self.overlay = Gtk.Overlay()
         self.overlay.set_vexpand(True)
         self.overlay.set_child(scroller)
-
-        self.pin_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.pin_slot.set_valign(Gtk.Align.START)
-        self.pin_slot.set_visible(False)
-        self.overlay.add_overlay(self.pin_slot)
 
         self.drop_tag = Gtk.Label(xalign=0)
         self.drop_tag.add_css_class("ccs-drop-tag")
@@ -686,9 +679,6 @@ class SessionWindow(Gtk.ApplicationWindow):
         self.drop_tag.set_visible(False)
         self.overlay.add_overlay(self.drop_tag)
 
-        adj = scroller.get_vadjustment()
-        adj.connect("value-changed", lambda *_: self._queue_pin_check())
-        adj.connect("changed", lambda *_: self._queue_pin_check())
         box.append(self.overlay)
 
         return box
@@ -1767,10 +1757,6 @@ class SessionWindow(Gtk.ApplicationWindow):
                 return False
             GLib.idle_add(hold, priority=GLib.PRIORITY_LOW)
 
-        # Row positions exist only after layout: check the pinned lid then.
-        self._pin_dirty = True
-        self._queue_pin_check()
-
     # -- stories -----------------------------------------------------------
 
     @staticmethod
@@ -1841,8 +1827,8 @@ class SessionWindow(Gtk.ApplicationWindow):
         self._attach_menu(row, lambda sid=story["id"]: self._story_menu(sid))
         return row
 
-    def _build_lid(self, story, members, collapsed, here_index=None, pinned=False):
-        """The raised box at the top of a story, also used for the pinned copy.
+    def _build_lid(self, story, members, collapsed, here_index=None):
+        """The raised box at the top of a story.
 
         Top line: grip slot, arrow, name, "+ add" (only while a session is
         dragged over it), member count, +▾. Second line: one square per
@@ -1873,10 +1859,7 @@ class SessionWindow(Gtk.ApplicationWindow):
         # The stripe on the left says how the story stands: its summary's
         # colour (needs you, finished, busy, idle, done...).
         lid.add_css_class("ccs-st-%s" % colour)
-        if not pinned:
-            self._story_colour[sid] = colour
-        if pinned:
-            lid.add_css_class("ccs-lid-pinned")
+        self._story_colour[sid] = colour
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         arrow = Gtk.Label(label="▸" if collapsed else "▾")
@@ -2201,107 +2184,6 @@ class SessionWindow(Gtk.ApplicationWindow):
         current = self.stack.get_visible_child()
         if current is not None:
             current.grab_focus()
-
-    # -- pinned lid ----------------------------------------------------------
-
-    def _queue_pin_check(self):
-        """Check the pinned lid once things settle. The scroll signals also
-        fire in the middle of a layout pass, which is no time to build
-        widgets; an idle after layout also folds a burst into one check."""
-        if not self._pin_queued:
-            self._pin_queued = True
-            GLib.idle_add(self._update_pinned_idle, priority=GLib.PRIORITY_LOW)
-
-    def _update_pinned_idle(self):
-        self._pin_queued = False
-        self._update_pinned()
-        return False
-
-    def _update_pinned(self):
-        """Pin a copy of the lid of the open story you are scrolled into.
-
-        A list row cannot stick on its own (GTK CSS has no sticky), so this
-        watches the scroll position: once an open story's lid is above the
-        top of the list while its tray is still on screen, a full, working
-        copy of the lid sits under the toolbar. When the tray's last row
-        reaches it, it simply goes away. One story at a time; folded stories
-        never pin, they have nothing below them.
-        """
-        if self._menu_open or self._dragging:
-            return
-        top = self.scroller.get_vadjustment().get_value()
-        chosen = None
-        for header in self._rows:
-            last = getattr(header, "last_member_row", None)
-            if getattr(header, "story", None) is None or last is None:
-                continue
-            ok, lid = header.compute_bounds(self.listbox)
-            ok2, end = last.compute_bounds(self.listbox)
-            if not (ok and ok2):
-                continue
-            if (lid.get_y() < top
-                    and end.get_y() + end.get_height() - top > lid.get_height()):
-                chosen = header
-                break
-        sid = chosen.story["id"] if chosen is not None else None
-        if sid is None:
-            if self.pin_slot.get_visible():
-                self.pin_slot.set_visible(False)
-            self._pinned_sid = None
-            return
-        if sid != self._pinned_sid or self._pin_dirty or not self.pin_slot.get_visible():
-            self._fill_pin_slot(chosen)
-        self._pinned_sid = sid
-        self._pin_dirty = False
-
-    def _fill_pin_slot(self, header):
-        child = self.pin_slot.get_first_child()
-        while child is not None:
-            nxt = child.get_next_sibling()
-            self.pin_slot.remove(child)
-            child = nxt
-        story = header.story
-        sid = story["id"]
-        members = self._story_items.get(sid, [])
-        pinned = self._build_lid(story, members, False, None, pinned=True)
-        if not self.app.auto_sort():
-            self._attach_story_grip(pinned, sid, ghosts=lambda: [pinned])
-        pinned.set_tooltip_text(header.get_tooltip_text())
-
-        # Clicking it does what clicking the lid does: fold, keep the session
-        # on screen and the keyboard in its terminal. Then bring the folded
-        # lid to the top, or you'd be left looking at whatever followed it.
-        # "released", so a drag from the grip (which claims the press) never
-        # folds anything; +▾ claims its own click.
-        click = Gtk.GestureClick(button=1)
-        click.connect("released", lambda *_: self._pinned_fold(sid))
-        pinned.add_controller(click)
-        self._attach_menu(pinned, lambda: self._story_menu(sid))
-        self._attach_drop(pinned, lambda payload: self._drop_plan(
-            payload, lid_sid=sid, lid_box=pinned))
-        self.pin_slot.append(pinned)
-        self.pin_slot.set_visible(True)
-
-    def _pinned_fold(self, sid):
-        header = next((r for r in self._rows if getattr(r, "story", None) is not None
-                       and r.story["id"] == sid), None)
-        lid_y = None
-        if header is not None:
-            ok, bounds = header.compute_bounds(self.listbox)
-            if ok:
-                lid_y = bounds.get_y()
-        self.pin_slot.set_visible(False)
-        self._pinned_sid = None
-        self._story_toggle(sid)
-        if lid_y is not None:
-            adj = self.scroller.get_vadjustment()
-            adj.set_value(lid_y)
-
-            def again():
-                # After the list has been laid out again.
-                adj.set_value(lid_y)
-                return False
-            GLib.idle_add(again, priority=GLib.PRIORITY_LOW)
 
     # -- actions -----------------------------------------------------------
 
@@ -3504,10 +3386,6 @@ class CCSessions(Gtk.Application):
             .ccs-list > row.ccs-story-row:selected > .ccs-lid,
             .ccs-lid-drop {{
                 background: mix({bg}, {sel}, 0.22); border-color: {sel};
-            }}
-            .ccs-lid-pinned {{
-                margin: 0 5px; border-radius: 0; border-top-width: 0;
-                border-bottom: 2px solid shade({bg}, 0.5);
             }}
             .ccs-lid .ccs-grip {{ color: {fg}; opacity: 0.85; }}
             .ccs-lid-line {{ margin-left: 3px; }}
