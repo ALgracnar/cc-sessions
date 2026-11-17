@@ -86,6 +86,35 @@ def load_config():
         return {}
 
 
+def release_widget(widget):
+    """Let a thrown-away widget tree actually be freed.
+
+    Every list rebuild used to leave its old rows in memory, ~2 MB a rebuild:
+    a row's drag, drop and click handlers point back at the row (and at its
+    Python attributes), so the row and its handlers kept each other alive
+    forever. After days of status changes the app held ~9 GB, much of it in
+    swap, and drawing the window waited on the disk: "not responding".
+    Removing the handlers breaks those loops. (The row keeps its Python
+    attributes, so code still holding an old row reads stale but valid data.)
+    """
+    stack = [widget]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Gtk.MenuButton):
+            # Its menu registers with the window's actions, and the window
+            # then kept every old story header's dropdown alive.
+            current.set_menu_model(None)
+            current.set_popover(None)
+        controllers = current.observe_controllers()
+        for controller in [controllers.get_item(i)
+                           for i in range(controllers.get_n_items())]:
+            current.remove_controller(controller)
+        child = current.get_first_child()
+        while child is not None:
+            stack.append(child)
+            child = child.get_next_sibling()
+
+
 class BackgroundWriter:
     """Writes the app's files from a thread of its own.
 
@@ -1680,6 +1709,7 @@ class SessionWindow(Gtk.ApplicationWindow):
             if row is None:
                 break
             self.listbox.remove(row)
+            release_widget(row)
         self._rows = []
         self._pointer_ages = []
         self._drop_lit = None
@@ -2019,16 +2049,21 @@ class SessionWindow(Gtk.ApplicationWindow):
         button.set_tooltip_text("Start something in this story")
         label = Gtk.Label(label="+▾")
         button.set_child(label)
-        model = Gio.Menu()
-        model.append_section(None, self._story_start_menu(sid))
-        model.append_section(None, self._story_done_menu(sid))
-        button.set_menu_model(model)
-        popover = button.get_popover()
-        if popover is not None:
+
+        # The menu is built only when the button is pressed. Built up front,
+        # every list rebuild made a menu for every story header, and those
+        # menus were never freed (~4 KB each, on every status change).
+        def build(btn):
+            model = Gio.Menu()
+            model.append_section(None, self._story_start_menu(sid))
+            model.append_section(None, self._story_done_menu(sid))
+            btn.set_menu_model(model)
+            popover = btn.get_popover()
+            if popover is None:
+                return
             # Same rule as the right-click menus: the list holds still while
             # the dropdown is open, or a rebuild would destroy it.
-            def shown(_pop):
-                self._menu_open = True
+            self._menu_open = True
 
             def closed(_pop):
                 def after():
@@ -2042,8 +2077,8 @@ class SessionWindow(Gtk.ApplicationWindow):
                     self.refresh()
                     return False
                 GLib.idle_add(after)
-            popover.connect("show", shown)
             popover.connect("closed", closed)
+        button.set_create_popup_func(build)
         return button
 
     def _story_start_menu(self, sid):
