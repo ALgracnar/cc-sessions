@@ -2407,6 +2407,10 @@ class CCSessions(Gtk.Application):
         self._owner_cache = {}    # (pid, proc start) -> (terminal pid, when)
         self._prev_status = {}    # key -> last seen status
         self.config = load_config()
+        # Stories saved by older versions may have members scattered through
+        # the stored order; gather them where each story is drawn now.
+        if self._gather_stories():
+            save_config(self.config)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -2970,6 +2974,38 @@ class CCSessions(Gtk.Application):
             marks = self.config.get(mark)
             if isinstance(marks, list):
                 self.config[mark] = [k for k in marks if k in ids]
+        self._gather_stories()
+
+    def _gather_stories(self):
+        """Keep each saved story's members side by side in the stored order.
+
+        A story is drawn where its first member sits in the stored order, but
+        a session that joins later is added at the very end of that order. So
+        a story dragged to the top, whose helpers joined afterwards, had those
+        helpers stored at the bottom: closing its top session dropped the
+        whole story to the bottom. Gathering the members where the story
+        already is keeps it in place whichever member goes. Returns whether
+        anything moved.
+        """
+        order = self.manual_order()
+        story_of = self.story_of()
+        if not order or not story_of:
+            return False
+        changed = False
+        for sid in {s["id"] for s in self.stories()}:
+            members = [k for k in order if story_of.get(k) == sid]
+            if len(members) < 2:
+                continue
+            at = order.index(members[0])
+            wanted = set(members)
+            rest = [k for k in order if k not in wanted]
+            gathered = rest[:at] + members + rest[at:]
+            if gathered != order:
+                order = gathered
+                changed = True
+        if changed:
+            self.config["manual_order"] = order
+        return changed
 
     def create_story(self, name, keys):
         sid = "s%d" % int(time.time() * 1000)
